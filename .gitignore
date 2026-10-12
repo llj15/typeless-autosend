@@ -7,3 +7,4 @@
 /.lock
 # Personal whitelist; see config.example.json for the template
 /config.json
+.DS_Store
