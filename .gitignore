@@ -1,0 +1,7 @@
+# 本机编译产物和运行时文件
+/typeless-autoenter
+/.build/
+/autoenter.log
+/.access-prompted
+# 个人白名单，模板见 config.example.json
+/config.json
