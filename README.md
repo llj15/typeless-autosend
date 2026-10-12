@@ -1,33 +1,33 @@
 # typeless-autoenter
 
-Typeless 转写完成、文字粘贴进输入框后，自动按一次回车发送。只在你指定的 App 里生效。仅支持 macOS。
+After Typeless finishes a transcription and pastes the text into the input box, press Return once to send it. Works only in the apps you choose. macOS only.
 
-## 原理
+## How it works
 
-Typeless 没有官方 hook。每次转写完成，它会往本地 SQLite（`~/Library/Application Support/Typeless/typeless.db`）写一条记录。本程序每 100ms 检查一次数据库文件有没有变化，变了才读库：发现新的"已完成"记录，且当前前台 App 在白名单里，就等 150ms，发一次 Return。
+Typeless has no official hook. Every time a transcription finishes, it writes a record to a local SQLite database (`~/Library/Application Support/Typeless/typeless.db`). This program checks every 100 ms whether the database files have changed, and reads the database only when they have. When it sees a new "completed" record and the frontmost app is on the whitelist, it waits 150 ms and sends one Return.
 
-## 前置条件
+## Prerequisites
 
-- macOS，已安装 Typeless 并登录
-- Xcode Command Line Tools：`xcode-select --install`（安装脚本会在本机编译）
-- 把本目录放在不受保护的位置，例如 `~/Developer/typeless-autoenter`；**不要放在桌面、文档、下载或 iCloud 里**，后台服务读不到那里的文件（`install.sh` 会拒绝安装）
-- Typeless 的历史记录保持开启（默认永久保留，`doctor` 会检查）
+- macOS, with Typeless installed and signed in
+- Xcode Command Line Tools: `xcode-select --install` (the install script builds on your machine)
+- Keep this directory somewhere unprotected, for example `~/Developer/typeless-autoenter`. **Do not put it in Desktop, Documents, Downloads or iCloud**: the background service cannot read files there (`install.sh` refuses to install).
+- Keep Typeless history turned on (it is kept forever by default; `doctor` checks this)
 
-## 安装
+## Install
 
 ```bash
-./install.sh --app com.mitchellh.ghostty    # --app 可重复，首次安装时写入白名单
+./install.sh --app com.mitchellh.ghostty    # --app can be repeated; writes the whitelist on first install
 ```
 
-脚本会：编译、生成并加载 LaunchAgent（`local.typeless-autoenter`，开机自启）、创建 `config.json`、运行一次自检。程序、配置和日志都在当前目录，**安装后不要移动目录**；移动了就重新运行 `./install.sh`。
+The script builds the binary, generates and loads a LaunchAgent (`local.typeless-autoenter`, starts at login), creates `config.json`, and runs a self-check. The program, config and log all live in this directory, so **do not move it after installing**; if you do, re-run `./install.sh`.
 
-### 授权辅助功能（必须）
+### Grant Accessibility permission (required)
 
-发送回车需要辅助功能权限。安装后第一次启动会弹一次授权窗，在 系统设置 → 隐私与安全性 → 辅助功能 里打开 `typeless-autoenter`。
+Sending Return needs Accessibility permission. The first start after installing shows a prompt once; turn on `typeless-autoenter` in System Settings → Privacy & Security → Accessibility.
 
-没弹窗，或列表里已有旧条目：先点 `−` 删掉，再点 `+` 添加本目录下的 `typeless-autoenter`。
+If no prompt appears, or an old entry is already listed: remove it with `−`, then add the `typeless-autoenter` in this directory with `+`.
 
-## 配置 `config.json`
+## Configuration: `config.json`
 
 ```json
 {
@@ -38,35 +38,35 @@ Typeless 没有官方 hook。每次转写完成，它会往本地 SQLite（`~/Li
 }
 ```
 
-- `config.json` 是白名单的唯一来源。每次转写完成时现读，改完立即生效，不用重启。
-- 查 Bundle ID：先打开目标 App，再运行 `./typeless-autoenter list-apps`；菜单栏、启动器类 App（Raycast、Alfred 等）要加 `--all` 才会列出。
-- 不区分大小写，会去掉首尾空格。
-- 文件缺失、格式错误或 `apps` 为空 = 不在任何 App 里回车，原因会写进 `autoenter.log`（`config missing` / `config invalid` / `config has no apps`）。
-- 不建议加代码编辑器：光标在代码区时，回车只会插入换行。
+- `config.json` is the only source of the whitelist. It is re-read every time a transcription finishes, so edits take effect immediately with no restart.
+- To find a Bundle ID: open the target app, then run `./typeless-autoenter list-apps`. Menu-bar and launcher apps (Raycast, Alfred, ...) are only listed with `--all`.
+- Matching is case-insensitive and ignores leading and trailing whitespace.
+- A missing or invalid file, or an empty `apps`, means Return is never sent in any app; the reason is written to `autoenter.log` (`config missing` / `config invalid` / `config has no apps`).
+- Code editors are not recommended: with the cursor in the code area, Return just inserts a newline.
 
-## 自检
+## Self-check
 
 ```bash
 ./typeless-autoenter doctor
 ```
 
-检查 Typeless、数据库和表结构、历史保留设置、白名单、后台服务的授权状态和运行状态。
+Checks Typeless, the database and its schema, the history retention setting, the whitelist, and the background service's permission and running state.
 
-## 升级
+## Upgrade
 
-更新源码后重新运行 `./install.sh`。二进制变了，辅助功能授权会失效，按上面"先删后加"重新授权一次。
+Update the source, then re-run `./install.sh`. The binary changes, so the Accessibility permission goes stale: remove the old entry and add it again, as described above.
 
-## 已知局限
+## Known limitations
 
-- 回车是在读到记录 150ms 后固定发出的，无法确认 Typeless 的粘贴已经完成。粘贴失败或特别慢时，可能发出一个空回车。
-- 依赖 Typeless 的本地数据库结构。Typeless 升级后表结构变了，程序会停止触发，并在日志里写 `db read failing: ...`。
-- 每次重新编译，辅助功能授权都要重做。
-- 只允许同时运行一个实例（目录下的 `.lock`）。想手动试跑，先 `./uninstall.sh` 停掉后台服务。
+- Return is sent a fixed 150 ms after the record is seen, and there is no way to confirm that Typeless has finished pasting. If the paste fails or is unusually slow, an empty Return may be sent.
+- It depends on Typeless's local database schema. If a Typeless upgrade changes the schema, the program stops triggering and writes `db read failing: ...` to the log.
+- The Accessibility permission has to be redone after every rebuild.
+- Only one instance runs at a time (`.lock` in this directory). To try it by hand, first stop the background service with `./uninstall.sh`.
 
-## 卸载
+## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-停止服务并移除 LaunchAgent。目录不会被删除，辅助功能里的条目需要手动删。
+Stops the service and removes the LaunchAgent. The directory is not deleted, and the entry in the Accessibility list has to be removed by hand.

@@ -1,9 +1,9 @@
-# 本机编译产物和运行时文件
+# Build output and runtime files for this machine
 /typeless-autoenter
 /.build/
 /autoenter.log
-/.access-prompted
-# 个人白名单，模板见 config.example.json
-/config.json
-/.lock
 /autoenter.log.1
+/.access-prompted
+/.lock
+# Personal whitelist; see config.example.json for the template
+/config.json

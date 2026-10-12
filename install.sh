@@ -1,7 +1,7 @@
 #!/bin/bash
-# typeless-autoenter 安装：就地编译、生成 LaunchAgent、启动服务。可重复运行，升级也用它。
-# 用法：./install.sh [--app <bundle id>]...
-#   首次安装时把这些 App 写进 config.json 白名单；config.json 已存在则不改动。
+# typeless-autoenter installer: build in place, generate the LaunchAgent, start the service. Safe to re-run; upgrades use it too.
+# Usage: ./install.sh [--app <bundle id>]...
+#   On first install, writes these apps to the config.json whitelist; an existing config.json is left untouched.
 set -euo pipefail
 cd "$(dirname "$0")"
 DIR="$(pwd -P)"
@@ -13,42 +13,44 @@ apps=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --app)
-      [ $# -ge 2 ] || { echo "--app 需要一个 Bundle ID" >&2; exit 2; }
-      echo "$2" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "Bundle ID 格式不对: $2" >&2; exit 2; }
+      [ $# -ge 2 ] || { echo "--app needs a Bundle ID" >&2; exit 2; }
+      echo "$2" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "Invalid Bundle ID: $2" >&2; exit 2; }
       apps+=("$2"); shift 2 ;;
     -h|--help) sed -n '2,4p' "$0"; exit 0 ;;
-    *) echo "未知参数: $1" >&2; exit 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-[ "$(uname)" = Darwin ] || { echo "只支持 macOS" >&2; exit 1; }
+[ "$(uname)" = Darwin ] || { echo "macOS only" >&2; exit 1; }
 swiftc --version >/dev/null 2>&1 || {
-  echo "swiftc 不可用：先运行 xcode-select --install 安装 Command Line Tools。" >&2
-  echo "已经装过的话：试试 sudo xcodebuild -license accept，或更新 Command Line Tools，再重新运行本脚本。" >&2
+  echo "swiftc is not available: run xcode-select --install to install the Command Line Tools." >&2
+  echo "If they are already installed, try sudo xcodebuild -license accept, or update the Command Line Tools, then re-run this script." >&2
   exit 1
 }
 case "$DIR" in
-  *[\&\<\>\"]*) echo "目录路径含 & < > \" 字符，换一个目录再安装" >&2; exit 1 ;;
+  *[\&\<\>\"]*) echo "The directory path contains one of & < > \" -- install from a different directory" >&2; exit 1 ;;
 esac
-# 后台服务读不了 macOS 受保护目录里的文件（读不到 config.json 就等于没开任何 App）
+# The background service cannot read files in macOS-protected folders (if it cannot read
+# config.json, no app is enabled at all).
 case "$DIR" in
   "$HOME/Desktop"|"$HOME/Desktop/"*|"$HOME/Documents"|"$HOME/Documents/"*|"$HOME/Downloads"|"$HOME/Downloads/"*|"$HOME/Library/Mobile Documents/"*|"$HOME/Library/CloudStorage/"*)
-    echo "当前目录在 macOS 受保护位置（桌面 / 文档 / 下载 / iCloud）：$DIR" >&2
-    echo "后台服务读不到这里的文件。请把整个目录移到别处，例如 ~/Developer/typeless-autoenter，再运行 ./install.sh" >&2
+    echo "This directory is in a macOS protected location (Desktop / Documents / Downloads / iCloud): $DIR" >&2
+    echo "The background service cannot read files there. Move the whole directory elsewhere, e.g. ~/Developer/typeless-autoenter, then run ./install.sh again." >&2
     exit 1 ;;
 esac
 if [ ! -d /Applications/Typeless.app ] && [ ! -d "$HOME/Applications/Typeless.app" ]; then
-  echo "警告：没找到 Typeless.app，继续安装（装在别处可以忽略）"
+  echo "Warning: Typeless.app not found; continuing anyway (ignore this if it lives elsewhere)"
 fi
 
-echo "==> 编译"
-# 先编到临时目录再替换：不会留下写了一半的二进制，签名标识也保持为 typeless-autoenter
+echo "==> Building"
+# Build into a temp directory first, then replace: no half-written binary is left behind,
+# and the code-signing identifier stays typeless-autoenter.
 mkdir -p .build
 swiftc -O main.swift -o .build/typeless-autoenter -lsqlite3
 mv .build/typeless-autoenter typeless-autoenter
 
 if [ ! -f config.json ]; then
-  echo "==> 创建 config.json"
+  echo "==> Creating config.json"
   if [ ${#apps[@]} -gt 0 ]; then
     n=${#apps[@]}; i=0
     {
@@ -65,15 +67,16 @@ if [ ! -f config.json ]; then
     cp config.example.json config.json
   fi
 elif [ ${#apps[@]} -gt 0 ]; then
-  echo "提示：config.json 已存在，没有改动，--app 参数被忽略；请直接编辑 config.json"
+  echo "Note: config.json already exists and was left untouched; --app was ignored. Edit config.json directly."
 fi
 
-# 重新安装后第一次启动会弹一次辅助功能授权窗
+# The first start after a (re)install shows the Accessibility prompt once.
 rm -f .access-prompted
-# 日志换新文件，自检只会读到这次启动的记录，不会读到旧二进制留下的授权状态
+# Switch to a fresh log file so the self-check only sees records from this start,
+# not the permission state left behind by the previous binary.
 if [ -f autoenter.log ]; then mv -f autoenter.log autoenter.log.1; fi
 
-echo "==> 注册并启动服务 ($LABEL)"
+echo "==> Registering and starting the service ($LABEL)"
 mkdir -p "$HOME/Library/LaunchAgents"
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -115,27 +118,29 @@ for _ in 1 2 3 4 5; do
   sleep 1
 done
 if [ "$loaded" -ne 1 ]; then
-  echo "launchctl bootstrap 失败：$err" >&2
-  echo "检查：系统设置 → 通用 → 登录项与扩展 里是否关掉了 typeless-autoenter；" >&2
-  echo "也可以运行 launchctl print-disabled gui/$UID_NUM | grep typeless 看是否被禁用。" >&2
+  echo "launchctl bootstrap failed: $err" >&2
+  echo "Check: System Settings → General → Login Items & Extensions, and make sure typeless-autoenter is not switched off." >&2
+  echo "You can also run launchctl print-disabled gui/$UID_NUM | grep typeless to see whether it is disabled." >&2
   exit 1
 fi
-# 等服务写出启动记录（最多 10 秒）
+# Wait for the service to write its start record (up to 10 seconds).
 for _ in $(seq 1 20); do
   grep -qs "started," autoenter.log && break
   sleep 0.5
 done
 
-echo "==> 自检"
+echo "==> Self-check"
 ./typeless-autoenter doctor || true
 
 cat <<EOF
 
-接下来：
-  1. 辅助功能授权：系统设置 → 隐私与安全性 → 辅助功能，打开 typeless-autoenter。
-     没弹窗或列表里已有旧条目（升级后旧条目会失效）：先点 − 删掉，再点 + 添加
+Next steps:
+  1. Grant Accessibility permission: System Settings → Privacy & Security → Accessibility,
+     then switch on typeless-autoenter.
+     If no prompt appeared, or an old entry is already listed (entries go stale after an upgrade):
+     remove it with −, then add this file with +
      $DIR/typeless-autoenter
-  2. 在 $DIR/config.json 的 apps 里填要自动回车的 App；
-     运行 ./typeless-autoenter list-apps 可以看到正在运行的 App 的 Bundle ID。
-  3. 随时运行 ./typeless-autoenter doctor 检查状态。日志：$DIR/autoenter.log
+  2. Put the apps that should get the automatic Enter into the apps array in $DIR/config.json.
+     Run ./typeless-autoenter list-apps to see the Bundle IDs of running apps.
+  3. Run ./typeless-autoenter doctor at any time to check the status. Log: $DIR/autoenter.log
 EOF

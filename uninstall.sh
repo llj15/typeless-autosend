@@ -1,19 +1,19 @@
 #!/bin/bash
-# typeless-autoenter 卸载：停止服务并移除 LaunchAgent。程序目录和 config.json 不动。
+# typeless-autoenter uninstaller: stop the service and remove the LaunchAgent. The program directory and config.json are left alone.
 set -euo pipefail
 LABEL="local.typeless-autoenter"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 UID_NUM="$(id -u)"
 
 launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
-# 确认服务真的停了再删 plist，否则进程会继续在 App 里发回车
+# Confirm the service is really stopped before deleting the plist; otherwise the process keeps pressing Enter in apps.
 if launchctl print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1; then
-  echo "警告：服务仍在运行，没能停掉，plist 保留未删：$PLIST" >&2
-  echo "手动停止：launchctl bootout gui/$UID_NUM/$LABEL" >&2
+  echo "Warning: the service is still running and could not be stopped; the plist was kept: $PLIST" >&2
+  echo "Stop it manually: launchctl bootout gui/$UID_NUM/$LABEL" >&2
   exit 1
 fi
 rm -f "$PLIST"
 
-echo "已停止服务并移除 $PLIST"
-echo "程序目录没有删除，不需要了可以直接删掉整个目录。"
-echo "辅助功能列表里的 typeless-autoenter 条目需要在系统设置里手动删除。"
+echo "Stopped the service and removed $PLIST"
+echo "The program directory was not deleted; remove the whole directory if you no longer need it."
+echo "The typeless-autoenter entry in the Accessibility list must be removed by hand in System Settings."

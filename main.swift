@@ -1,35 +1,41 @@
-// typeless-autoenter: Typeless 转写完成并粘贴后，若前台 App 在 config.json 白名单里，自动按一次回车。
-// 信号来源：Typeless 的 typeless.db 中 history_v2 出现新的 completed 记录。
+// typeless-autoenter: after Typeless finishes a transcription and pastes it, press Return once
+// if the frontmost app is on the config.json whitelist.
+// Signal source: a new completed record appearing in history_v2 of Typeless's typeless.db.
 //
-//   typeless-autoenter            作为后台服务运行（由 install.sh 注册为 LaunchAgent）
-//   typeless-autoenter doctor     自检：Typeless、数据库、配置、授权、服务
-//   typeless-autoenter list-apps  列出正在运行的 App 的 Bundle ID，用来填 config.json
+//   typeless-autoenter            run as the background service (registered as a LaunchAgent by install.sh)
+//   typeless-autoenter doctor     self-check: Typeless, database, config, permission, service
+//   typeless-autoenter list-apps  list the Bundle IDs of running apps, for filling in config.json
 import AppKit
 import ApplicationServices
 import Foundation
 import SQLite3
 
 let env = ProcessInfo.processInfo.environment
-// 程序所在目录：config.json、日志、授权标记都放这里（install.sh 就地编译，移动目录后需重新运行 install.sh）
+// Program directory: config.json, the log and the permission-prompt marker live here
+// (install.sh builds in place; re-run install.sh after moving the directory).
 let programDir = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
     .resolvingSymlinksInPath().deletingLastPathComponent().path
 let dbPath = env["TYPELESS_DB"] ?? NSHomeDirectory() + "/Library/Application Support/Typeless/typeless.db"
-// 生效 App 白名单放在配置文件里，每次触发时现读，改完无需重启、重新编译或重新授权
+// The app whitelist lives in the config file and is re-read on every trigger,
+// so edits need no restart, rebuild or re-authorization.
 let configPath = env["TYPELESS_AUTOENTER_CONFIG"] ?? programDir + "/config.json"
 let logPath = programDir + "/autoenter.log"
 let promptMarkerPath = programDir + "/.access-prompted"
 let serviceLabel = "local.typeless-autoenter"
-// dry run：不检查真实前台、不真正按键，只打日志（测试用）
+// Dry run: skip the real frontmost-app check and never press a key, only log (for tests).
 let dryRun = env["TYPELESS_DRY_RUN"] == "1"
 let pasteModes: Set<String> = ["voice_transcript", "voice_translation"]
 let requiredColumns: Set<String> = ["id", "mode", "status", "refined_text", "updated_at"]
 let pollInterval: TimeInterval = 0.1
 let enterDelay: TimeInterval = Double(env["TYPELESS_ENTER_DELAY"] ?? "") ?? 0.15
-// 只看最近 N 条本地记录（rowid 单调递增），不依赖 created_at，长录音也能命中
+// Only look at the most recent N local records (rowid is monotonic), independent of created_at,
+// so long recordings are still caught.
 let recentRowCount = 20
-// updated_at 与当前时间相差超过该值视为旧记录，防止迟到的触发
+// A record whose updated_at differs from the current time by more than this is treated as old,
+// so late triggers are ignored.
 let freshnessSeconds: TimeInterval = 10
-// 读库连续失败这么多次才记日志，避免 Typeless 短暂持锁时刷屏；之后降频重试
+// Log a database read failure only after this many consecutive failures, so a brief lock held
+// by Typeless does not flood the log; after that, retry less often.
 let persistentFailureCount = 20
 
 let isoFrac: ISO8601DateFormatter = {
@@ -69,7 +75,8 @@ func tableColumns(_ db: OpaquePointer?) -> Set<String>? {
     }
 }
 
-// 失败（锁冲突、表结构不兼容、文件缺失等）带原因返回，调用方下一轮重试
+// Failures (lock contention, incompatible schema, missing file, ...) are returned with a reason;
+// the caller retries on the next tick.
 func fetchRecentCompleted() -> Result<[Row], FetchError> {
     var db: OpaquePointer?
     guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
@@ -91,7 +98,8 @@ func fetchRecentCompleted() -> Result<[Row], FetchError> {
         return .failure(FetchError(message: "history_v2 missing columns: \(missing.sorted().joined(separator: ", ")) (incompatible Typeless version?)"))
     }
 
-    // 云端同步/回填写入的行（synced_from_cloud=1）不是本机听写，不能占「最近 N 条」的名额；老版本没有这一列就不过滤
+    // Rows written by cloud sync / backfill (synced_from_cloud=1) are not local dictations and must not
+    // take up slots in the "most recent N" window; older versions without this column are not filtered.
     let local = columns.contains("synced_from_cloud") ? "synced_from_cloud = 0" : "1"
     let sql = """
         SELECT id, mode, length(coalesce(refined_text, '')), updated_at FROM history_v2
@@ -125,7 +133,8 @@ func fileSig(_ path: String) -> FileSig {
     return FileSig(mtime: attrs?[.modificationDate] as? Date, size: (attrs?[.size] as? NSNumber)?.intValue)
 }
 
-// 同时盯主库和 -wal：Typeless 若换成 WAL 模式，写入先落在 -wal 里，主库 mtime 要等 checkpoint 才变
+// Watch both the main database and its -wal file: if Typeless switches to WAL mode, writes land
+// in the -wal first and the main file's mtime only changes on checkpoint.
 func dbSignature() -> [FileSig] { [fileSig(dbPath), fileSig(dbPath + "-wal")] }
 
 struct Config: Decodable { let apps: [String] }
@@ -137,10 +146,12 @@ func readConfig() -> Result<[String], ConfigError> {
     return .success(config.apps)
 }
 
-// 文件缺失或格式错误时回退到空白名单（全部不回车），宁可不发也不在别的 App 里乱回车
+// A missing or invalid config falls back to an empty whitelist (never press Enter):
+// better to send nothing than to press Enter in the wrong app.
 func loadTargetBundleIDs() -> Set<String> {
     var result = readConfig()
-    // 编辑器非原子写入时可能读到半截文件，隔一会儿再读一次，避免误判成写坏
+    // An editor with non-atomic writes can leave a half-written file; read once more after a short
+    // pause so that is not mistaken for a broken config.
     if case .failure(.invalid) = result {
         Thread.sleep(forTimeInterval: 0.05)
         result = readConfig()
@@ -148,7 +159,7 @@ func loadTargetBundleIDs() -> Set<String> {
     switch result {
     case .success(let apps):
         if apps.isEmpty { log("config has no apps, nothing enabled: \(configPath)") }
-        // Bundle ID 手写容易大小写、空格出错，统一规整后再比较
+        // Hand-written Bundle IDs are easy to get wrong in case or whitespace; normalize before comparing.
         return Set(apps.map(normalizeBundleID))
     case .failure(.missing):
         log("config missing, no apps enabled: \(configPath)")
@@ -166,7 +177,7 @@ func normalizeBundleID(_ id: String) -> String {
 func frontmostIsTarget() -> (Bool, String) {
     let front: String
     if dryRun {
-        // dry run 下可用 TYPELESS_FAKE_FRONT 模拟前台 App，不设则恒通过
+        // In dry run, TYPELESS_FAKE_FRONT simulates the frontmost app; if unset the check always passes.
         guard let fake = env["TYPELESS_FAKE_FRONT"] else { return (true, "dry-run") }
         front = fake
     } else {
@@ -183,15 +194,15 @@ func pressEnter() {
     let src = CGEventSource(stateID: .hidSystemState)
     for down in [true, false] {
         guard let ev = CGEvent(keyboardEventSource: src, virtualKey: 0x24, keyDown: down) else { continue }
-        // 清掉残留的 Fn 等修饰键标志，否则 fn+Return 会变成小键盘 Enter
+        // Clear leftover modifier flags such as Fn, otherwise fn+Return turns into keypad Enter.
         ev.flags = []
         ev.post(tap: .cghidEventTap)
     }
 }
 
-// MARK: - 子命令
+// MARK: - Subcommands
 
-// includeAccessory：连菜单栏、启动器类 App（Raycast、Alfred 等）一起列出
+// includeAccessory: also list menu-bar and launcher apps (Raycast, Alfred, ...).
 func listApps(includeAccessory: Bool) {
     let apps = NSWorkspace.shared.runningApplications
         .filter { $0.activationPolicy == .regular || (includeAccessory && $0.activationPolicy == .accessory) }
@@ -223,14 +234,14 @@ func runDoctor() -> Int32 {
 
     let appPaths = ["/Applications/Typeless.app", NSHomeDirectory() + "/Applications/Typeless.app"]
     if appPaths.contains(where: { FileManager.default.fileExists(atPath: $0) }) {
-        ok("已安装 Typeless")
+        ok("Typeless is installed")
     } else {
-        warn("没找到 Typeless.app（装在别处可以忽略）")
+        warn("Typeless.app not found (ignore this if it lives elsewhere)")
     }
 
     switch fetchRecentCompleted() {
-    case .success(let rows): ok("数据库可读，表结构兼容（最近 \(rows.count) 条已完成记录）")
-    case .failure(let error): fail("数据库不可用：\(error.message)")
+    case .success(let rows): ok("Database readable, schema compatible (\(rows.count) recent completed records)")
+    case .failure(let error): fail("Database unavailable: \(error.message)")
     }
 
     let settingsURL = URL(fileURLWithPath: dbPath).deletingLastPathComponent().appendingPathComponent("app-settings.json")
@@ -238,52 +249,53 @@ func runDoctor() -> Int32 {
        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
        let seconds = json["historyDurationSeconds"] as? Int {
         if seconds == -1 {
-            ok("Typeless 历史记录永久保留")
+            ok("Typeless keeps its history forever")
         } else {
-            warn("Typeless 历史只保留 \(seconds) 秒：记录可能在被检测到之前就被清理，建议在 Typeless 设置里改成永久")
+            warn("Typeless keeps its history for only \(seconds) seconds: records may be purged before they are detected; set it to forever in Typeless settings")
         }
     } else {
-        warn("读不到 Typeless 的历史保留设置，已跳过")
+        warn("Cannot read Typeless's history retention setting, skipped")
     }
 
     switch readConfig() {
     case .failure(.missing):
-        fail("配置文件不存在：\(configPath)")
+        fail("Config file not found: \(configPath)")
     case .failure(.invalid):
-        fail("配置文件格式错误，需要 {\"apps\": [\"bundle.id\", ...]}：\(configPath)")
+        fail("Config file is invalid, expected {\"apps\": [\"bundle.id\", ...]}: \(configPath)")
     case .success(let apps):
         if apps.isEmpty {
-            fail("config.json 的 apps 为空，不会在任何 App 里回车；运行 list-apps 查 Bundle ID")
+            fail("config.json has no apps, so Enter is never sent; run list-apps to find Bundle IDs")
         }
         for id in apps {
             if NSWorkspace.shared.urlForApplication(withBundleIdentifier: id.trimmingCharacters(in: .whitespacesAndNewlines)) == nil {
-                warn("\(id)：没找到对应的已安装 App，检查拼写")
+                warn("\(id): no installed app found for this Bundle ID, check the spelling")
             } else {
-                ok("白名单：\(id)")
+                ok("Whitelisted: \(id)")
             }
         }
     }
 
-    // 看服务自己记录的授权状态：从终端运行 doctor 时，权限是算在终端头上的，不能代表后台服务
+    // Report the permission state recorded by the service itself: when doctor runs from a terminal,
+    // the permission counts against the terminal and says nothing about the background service.
     if let text = try? String(contentsOfFile: logPath, encoding: .utf8),
        let line = text.split(separator: "\n").last(where: { $0.contains("accessibility trusted=") }) {
         if line.contains("accessibility trusted=true") {
-            ok("后台服务已获得辅助功能权限")
+            ok("Background service has Accessibility permission")
         } else {
-            fail("后台服务没有辅助功能权限：系统设置 → 隐私与安全性 → 辅助功能；列表里若已有 typeless-autoenter 先点 − 删掉，再用 + 添加 \(programDir)/typeless-autoenter")
+            fail("Background service lacks Accessibility permission: System Settings → Privacy & Security → Accessibility. If typeless-autoenter is already listed, remove it with − first, then add \(programDir)/typeless-autoenter with +")
         }
     } else {
-        warn("日志里还没有服务的授权记录（服务没启动过？）")
+        warn("No Accessibility record from the service in the log yet (has it ever started?)")
     }
 
     if let result = launchctlOutput(["print", "gui/\(getuid())/\(serviceLabel)"]),
        result.status == 0, result.output.contains("state = running") {
-        ok("后台服务在运行")
+        ok("Background service is running")
     } else {
-        fail("后台服务没在运行：重新运行 install.sh")
+        fail("Background service is not running: re-run install.sh")
     }
 
-    print(failures == 0 ? "一切正常" : "有 \(failures) 项需要处理")
+    print(failures == 0 ? "All good" : "\(failures) issue(s) to fix")
     return failures == 0 ? 0 : 1
 }
 
@@ -295,9 +307,10 @@ if let unknown = subcommand {
     exit(2)
 }
 
-// MARK: - 后台服务
+// MARK: - Background service
 
-// 单实例：重复运行（手动执行、搬目录后旧实例还在）会让一次转写回车多次，拿不到锁就退出（退出码 0，launchd 不会重启）
+// Single instance: a duplicate (run by hand, or an old instance left after moving the directory) would
+// press Enter several times per transcription. If the lock cannot be taken, exit with status 0 so launchd does not restart it.
 let lockPath = programDir + "/.lock"
 let lockFD = open(lockPath, O_CREAT | O_RDWR, 0o600)
 if lockFD < 0 {
@@ -313,19 +326,20 @@ if dryRun {
 } else {
     lastTrusted = accessibilityTrusted()
     if !lastTrusted && !FileManager.default.fileExists(atPath: promptMarkerPath) {
-        // 每次安装后的第一次启动弹一次授权窗；之后服务重启不再弹，避免反复打扰
+        // Show the authorization prompt once, on the first start after each install; later service
+        // restarts do not prompt again, to avoid nagging.
         FileManager.default.createFile(atPath: promptMarkerPath, contents: nil)
         _ = accessibilityTrusted(prompt: true)
     }
     log("started, accessibility trusted=\(lastTrusted), enterDelay=\(enterDelay)s, config=\(configPath)")
 }
 
-// 首次成功读库后才建立基线，基线内的记录不触发
+// The baseline is built after the first successful database read; records in it never trigger.
 var seen: Set<String>?
 var lastSig: [FileSig] = []
 var failures = 0
 var tick = 0
-// 已有一次回车在排队时，同一时间窗里的其它记录并入它，不连发
+// While one Enter is already queued, other records in the same window fold into it instead of firing again.
 var enterPending = false
 
 func process(_ rows: [Row]) {
@@ -340,10 +354,11 @@ func process(_ rows: [Row]) {
         let age = row.updatedAt.map { Date().timeIntervalSince($0) }
         let ageText = age.map { String(format: "%.1fs", $0) } ?? "?"
         let fresh = age.map { abs($0) < freshnessSeconds } ?? false
-        // 状态先变 completed、文本稍后才写入的记录：新鲜期内先不消费，等文本到了再处理（真空记录过期后按旧记录跳过）
+        // A record whose status turned completed before its text was written: while it is fresh, do not
+        // consume it yet and wait for the text (a genuinely empty record is skipped as old once it goes stale).
         if fresh && row.textLen == 0 && pasteModes.contains(row.mode) { continue }
         known.insert(row.id)
-        // 先判断便宜的条件，通过了才去读配置和前台
+        // Check the cheap conditions first; only then read the config and the frontmost app.
         guard pasteModes.contains(row.mode), row.textLen > 0, fresh else {
             log("skip id=\(row.id) mode=\(row.mode) len=\(row.textLen) age=\(ageText)")
             continue
@@ -381,7 +396,8 @@ func process(_ rows: [Row]) {
 
 let timer = Timer(timeInterval: pollInterval, repeats: true) { _ in
     tick += 1
-    // 每 5 秒看一次授权状态，变化时记一行（doctor 靠这行判断后台服务有没有权限）
+    // Check the permission state every 5 seconds and log a line when it changes
+    // (doctor relies on this line to tell whether the background service has permission).
     if !dryRun && tick % 50 == 0 {
         let trusted = accessibilityTrusted()
         if trusted != lastTrusted {
@@ -389,7 +405,8 @@ let timer = Timer(timeInterval: pollInterval, repeats: true) { _ in
             log("accessibility trusted=\(trusted) (changed)")
         }
     }
-    // 持续失败后降频到每秒一次，避免每 100ms 反复打开数据库、等锁
+    // After persistent failures, drop to one retry per second instead of reopening the database
+    // and waiting on its lock every 100ms.
     if failures >= persistentFailureCount && tick % 10 != 0 { return }
 
     let sig = dbSignature()
