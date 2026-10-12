@@ -139,8 +139,15 @@ func readConfig() -> Result<[String], ConfigError> {
 
 // 文件缺失或格式错误时回退到空白名单（全部不回车），宁可不发也不在别的 App 里乱回车
 func loadTargetBundleIDs() -> Set<String> {
-    switch readConfig() {
+    var result = readConfig()
+    // 编辑器非原子写入时可能读到半截文件，隔一会儿再读一次，避免误判成写坏
+    if case .failure(.invalid) = result {
+        Thread.sleep(forTimeInterval: 0.05)
+        result = readConfig()
+    }
+    switch result {
     case .success(let apps):
+        if apps.isEmpty { log("config has no apps, nothing enabled: \(configPath)") }
         // Bundle ID 手写容易大小写、空格出错，统一规整后再比较
         return Set(apps.map(normalizeBundleID))
     case .failure(.missing):
@@ -184,9 +191,10 @@ func pressEnter() {
 
 // MARK: - 子命令
 
-func listApps() {
+// includeAccessory：连菜单栏、启动器类 App（Raycast、Alfred 等）一起列出
+func listApps(includeAccessory: Bool) {
     let apps = NSWorkspace.shared.runningApplications
-        .filter { $0.activationPolicy == .regular }
+        .filter { $0.activationPolicy == .regular || (includeAccessory && $0.activationPolicy == .accessory) }
         .compactMap { app in app.bundleIdentifier.map { (app.localizedName ?? "?", $0) } }
         .sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
     for (name, id) in apps { print("\(id)\t\(name)") }
@@ -280,14 +288,24 @@ func runDoctor() -> Int32 {
 }
 
 let subcommand = CommandLine.arguments.dropFirst().first
-if subcommand == "list-apps" { listApps(); exit(0) }
+if subcommand == "list-apps" { listApps(includeAccessory: CommandLine.arguments.contains("--all")); exit(0) }
 if subcommand == "doctor" { exit(runDoctor()) }
 if let unknown = subcommand {
-    FileHandle.standardError.write(Data("unknown command: \(unknown)\nusage: typeless-autoenter [doctor|list-apps]\n".utf8))
+    FileHandle.standardError.write(Data("unknown command: \(unknown)\nusage: typeless-autoenter [doctor|list-apps [--all]]\n".utf8))
     exit(2)
 }
 
 // MARK: - 后台服务
+
+// 单实例：重复运行（手动执行、搬目录后旧实例还在）会让一次转写回车多次，拿不到锁就退出（退出码 0，launchd 不会重启）
+let lockPath = programDir + "/.lock"
+let lockFD = open(lockPath, O_CREAT | O_RDWR, 0o600)
+if lockFD < 0 {
+    log("warning: cannot create lock file \(lockPath), single-instance protection off")
+} else if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+    log("another instance is already running, exiting (lock: \(lockPath))")
+    exit(0)
+}
 
 var lastTrusted = true
 if dryRun {
@@ -319,10 +337,12 @@ func process(_ rows: [Row]) {
     defer { seen = known }
 
     for row in rows where !known.contains(row.id) {
-        known.insert(row.id)
         let age = row.updatedAt.map { Date().timeIntervalSince($0) }
         let ageText = age.map { String(format: "%.1fs", $0) } ?? "?"
         let fresh = age.map { abs($0) < freshnessSeconds } ?? false
+        // 状态先变 completed、文本稍后才写入的记录：新鲜期内先不消费，等文本到了再处理（真空记录过期后按旧记录跳过）
+        if fresh && row.textLen == 0 && pasteModes.contains(row.mode) { continue }
+        known.insert(row.id)
         // 先判断便宜的条件，通过了才去读配置和前台
         guard pasteModes.contains(row.mode), row.textLen > 0, fresh else {
             log("skip id=\(row.id) mode=\(row.mode) len=\(row.textLen) age=\(ageText)")

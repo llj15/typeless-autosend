@@ -3,8 +3,15 @@
 set -euo pipefail
 LABEL="local.typeless-autoenter"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+UID_NUM="$(id -u)"
 
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+# 确认服务真的停了再删 plist，否则进程会继续在 App 里发回车
+if launchctl print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1; then
+  echo "警告：服务仍在运行，没能停掉，plist 保留未删：$PLIST" >&2
+  echo "手动停止：launchctl bootout gui/$UID_NUM/$LABEL" >&2
+  exit 1
+fi
 rm -f "$PLIST"
 
 echo "已停止服务并移除 $PLIST"

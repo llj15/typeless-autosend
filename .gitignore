@@ -5,3 +5,5 @@
 /.access-prompted
 # 个人白名单，模板见 config.example.json
 /config.json
+/.lock
+/autoenter.log.1

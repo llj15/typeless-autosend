@@ -4,12 +4,13 @@ Typeless 转写完成、文字粘贴进输入框后，自动按一次回车发�
 
 ## 原理
 
-Typeless 没有官方 hook。每次转写完成，它会往本地 SQLite（`~/Library/Application Support/Typeless/typeless.db`）写一条记录。本程序每 100ms 看一眼这个库：发现新的"已完成"记录，且当前前台 App 在白名单里，就等 150ms，发一次 Return。
+Typeless 没有官方 hook。每次转写完成，它会往本地 SQLite（`~/Library/Application Support/Typeless/typeless.db`）写一条记录。本程序每 100ms 检查一次数据库文件有没有变化，变了才读库：发现新的"已完成"记录，且当前前台 App 在白名单里，就等 150ms，发一次 Return。
 
 ## 前置条件
 
 - macOS，已安装 Typeless 并登录
 - Xcode Command Line Tools：`xcode-select --install`（安装脚本会在本机编译）
+- 把本目录放在不受保护的位置，例如 `~/Developer/typeless-autoenter`；**不要放在桌面、文档、下载或 iCloud 里**，后台服务读不到那里的文件（`install.sh` 会拒绝安装）
 - Typeless 的历史记录保持开启（默认永久保留，`doctor` 会检查）
 
 ## 安装
@@ -38,9 +39,9 @@ Typeless 没有官方 hook。每次转写完成，它会往本地 SQLite（`~/Li
 ```
 
 - `config.json` 是白名单的唯一来源。每次转写完成时现读，改完立即生效，不用重启。
-- 查 Bundle ID：先打开目标 App，再运行 `./typeless-autoenter list-apps`。
+- 查 Bundle ID：先打开目标 App，再运行 `./typeless-autoenter list-apps`；菜单栏、启动器类 App（Raycast、Alfred 等）要加 `--all` 才会列出。
 - 不区分大小写，会去掉首尾空格。
-- 文件缺失、格式错误或 `apps` 为空 = 不在任何 App 里回车，原因会写进 `autoenter.log`。
+- 文件缺失、格式错误或 `apps` 为空 = 不在任何 App 里回车，原因会写进 `autoenter.log`（`config missing` / `config invalid` / `config has no apps`）。
 - 不建议加代码编辑器：光标在代码区时，回车只会插入换行。
 
 ## 自检
@@ -60,6 +61,7 @@ Typeless 没有官方 hook。每次转写完成，它会往本地 SQLite（`~/Li
 - 回车是在读到记录 150ms 后固定发出的，无法确认 Typeless 的粘贴已经完成。粘贴失败或特别慢时，可能发出一个空回车。
 - 依赖 Typeless 的本地数据库结构。Typeless 升级后表结构变了，程序会停止触发，并在日志里写 `db read failing: ...`。
 - 每次重新编译，辅助功能授权都要重做。
+- 只允许同时运行一个实例（目录下的 `.lock`）。想手动试跑，先 `./uninstall.sh` 停掉后台服务。
 
 ## 卸载
 
