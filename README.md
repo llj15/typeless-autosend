@@ -63,6 +63,14 @@ Update the source, then re-run `./install.sh`. The binary changes, so the Access
 - The Accessibility permission has to be redone after every rebuild.
 - Only one instance runs at a time (`.lock` in this directory). A second instance waits up to 5 seconds for the lock, then exits. To try it by hand, first stop the background service with `./uninstall.sh`.
 
+## Tests
+
+```bash
+tests/run.sh
+```
+
+Builds a separate binary and runs every `tests/test_*.py` (needs the Xcode Command Line Tools and `python3`). The tests use dry-run mode, throw-away databases and a sandboxed `HOME` with stub `swiftc` and `launchctl`, so they never touch an installed service. They take a few minutes; logs are kept in `tests/.work` only when something fails.
+
 ## Uninstall
 
 ```bash

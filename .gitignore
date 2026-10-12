@@ -8,3 +8,5 @@
 # Personal whitelist; see config.example.json for the template
 /config.json
 .DS_Store
+/tests/.work/
+/tests/__pycache__/
