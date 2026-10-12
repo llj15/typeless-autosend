@@ -61,7 +61,7 @@ Update the source, then re-run `./install.sh`. The binary changes, so the Access
 - Return is sent a fixed 150 ms after the record is seen, and there is no way to confirm that Typeless has finished pasting. If the paste fails or is unusually slow, an empty Return may be sent.
 - It depends on Typeless's local database schema. If a Typeless upgrade changes the schema, the program stops triggering and writes `db read failing: ...` to the log.
 - The Accessibility permission has to be redone after every rebuild.
-- Only one instance runs at a time (`.lock` in this directory). To try it by hand, first stop the background service with `./uninstall.sh`.
+- Only one instance runs at a time (`.lock` in this directory). A second instance waits up to 5 seconds for the lock, then exits. To try it by hand, first stop the background service with `./uninstall.sh`.
 
 ## Uninstall
 

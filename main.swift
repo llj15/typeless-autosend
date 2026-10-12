@@ -37,6 +37,9 @@ let freshnessSeconds: TimeInterval = 10
 // Log a database read failure only after this many consecutive failures, so a brief lock held
 // by Typeless does not flood the log; after that, retry less often.
 let persistentFailureCount = 20
+// How long a new instance waits for the single-instance lock before concluding that another one is really running.
+let lockWait: TimeInterval = Double(env["TYPELESS_LOCK_WAIT"] ?? "") ?? 5
+let lockRetryInterval: TimeInterval = 0.25
 
 let isoFrac: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
@@ -309,15 +312,29 @@ if let unknown = subcommand {
 
 // MARK: - Background service
 
-// Single instance: a duplicate (run by hand, or an old instance left after moving the directory) would
-// press Enter several times per transcription. If the lock cannot be taken, exit with status 0 so launchd does not restart it.
+// Single instance: a second instance in the same directory (run by hand, or a leftover from a restart race)
+// would press Enter several times per transcription. If another instance still holds the lock after the wait,
+// exit with status 0 so launchd does not restart it. The wait covers the old instance that is still shutting
+// down, e.g. right after install.sh's bootout.
 let lockPath = programDir + "/.lock"
 let lockFD = open(lockPath, O_CREAT | O_RDWR, 0o600)
 if lockFD < 0 {
     log("warning: cannot create lock file \(lockPath), single-instance protection off")
-} else if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
-    log("another instance is already running, exiting (lock: \(lockPath))")
-    exit(0)
+} else {
+    let lockDeadline = Date().addingTimeInterval(lockWait)
+    while flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+        if errno == EINTR { continue }
+        // Only EWOULDBLOCK means someone else holds the lock; any other failure must not kill the service.
+        guard errno == EWOULDBLOCK else {
+            log("warning: cannot lock \(lockPath) (errno \(errno)), single-instance protection off")
+            break
+        }
+        if Date() >= lockDeadline {
+            log("another instance is already running, exiting (lock: \(lockPath))")
+            exit(0)
+        }
+        Thread.sleep(forTimeInterval: lockRetryInterval)
+    }
 }
 
 var lastTrusted = true

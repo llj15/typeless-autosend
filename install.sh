@@ -32,8 +32,11 @@ case "$DIR" in
 esac
 # The background service cannot read files in macOS-protected folders (if it cannot read
 # config.json, no app is enabled at all).
-case "$DIR" in
-  "$HOME/Desktop"|"$HOME/Desktop/"*|"$HOME/Documents"|"$HOME/Documents/"*|"$HOME/Downloads"|"$HOME/Downloads/"*|"$HOME/Library/Mobile Documents/"*|"$HOME/Library/CloudStorage/"*)
+# macOS volumes are case-insensitive by default, so ~/desktop reaches the same folder: compare in lower case.
+dir_lc="$(printf '%s' "$DIR" | tr '[:upper:]' '[:lower:]')"
+home_lc="$(printf '%s' "$HOME" | tr '[:upper:]' '[:lower:]')"
+case "$dir_lc" in
+  "$home_lc/desktop"|"$home_lc/desktop/"*|"$home_lc/documents"|"$home_lc/documents/"*|"$home_lc/downloads"|"$home_lc/downloads/"*|"$home_lc/library/mobile documents/"*|"$home_lc/library/cloudstorage/"*)
     echo "This directory is in a macOS protected location (Desktop / Documents / Downloads / iCloud): $DIR" >&2
     echo "The background service cannot read files there. Move the whole directory elsewhere, e.g. ~/Developer/typeless-autoenter, then run ./install.sh again." >&2
     exit 1 ;;
