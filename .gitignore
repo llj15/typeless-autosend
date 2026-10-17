@@ -10,3 +10,8 @@
 .DS_Store
 /tests/.work/
 /tests/__pycache__/
+
+# Isolated feature test binaries and runtime state
+/tests/.*-work/
+/runtime-status.json
+/config.json.lock

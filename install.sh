@@ -48,10 +48,18 @@ fi
 # Never replace a command owned by another installation or tool.
 BIN_DIR="$HOME/.local/bin"
 COMMAND_LINK="$BIN_DIR/typeless-autoenter"
+RELOCATE_LINK=0
 if [ -e "$COMMAND_LINK" ] || [ -L "$COMMAND_LINK" ]; then
   if [ ! -L "$COMMAND_LINK" ] || [ "$(readlink "$COMMAND_LINK")" != "$DIR/typeless-autoenter" ]; then
-    echo "Command already exists: $COMMAND_LINK. Remove or relocate it before installing." >&2
-    exit 1
+    # A dangling link matching our registered LaunchAgent belongs to the moved install.
+    registered_binary="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null || true)"
+    if [ -L "$COMMAND_LINK" ] && [ ! -e "$COMMAND_LINK" ] &&
+       [ -n "$registered_binary" ] && [ "$(readlink "$COMMAND_LINK")" = "$registered_binary" ]; then
+      RELOCATE_LINK=1
+    else
+      echo "Command already exists: $COMMAND_LINK. Remove or relocate it before installing." >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -59,7 +67,7 @@ echo "==> Building"
 # Build into a temp directory first, then replace: no half-written binary is left behind,
 # and the code-signing identifier stays typeless-autoenter.
 mkdir -p .build
-swiftc -O main.swift -o .build/typeless-autoenter -lsqlite3
+swiftc -O ./*.swift -o .build/typeless-autoenter -lsqlite3
 mv .build/typeless-autoenter typeless-autoenter
 
 if [ ! -f config.json ]; then
@@ -144,6 +152,7 @@ done
 
 echo "==> Installing command in $BIN_DIR"
 mkdir -p "$BIN_DIR"
+if [ "$RELOCATE_LINK" -eq 1 ]; then rm "$COMMAND_LINK"; fi
 if [ ! -L "$COMMAND_LINK" ]; then ln -s "$DIR/typeless-autoenter" "$COMMAND_LINK"; fi
 # Configure only the login user's shell. Never duplicate our marked block.
 case "${SHELL:-/bin/zsh}" in

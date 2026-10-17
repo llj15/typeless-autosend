@@ -13,6 +13,12 @@ if launchctl print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1; then
   exit 1
 fi
 rm -f "$PLIST"
+DIR="$(cd "$(dirname "$0")" && pwd -P)"
+COMMAND_LINK="$HOME/.local/bin/typeless-autoenter"
+if [ -L "$COMMAND_LINK" ] && [ "$(readlink "$COMMAND_LINK")" = "$DIR/typeless-autoenter" ]; then
+  rm "$COMMAND_LINK"
+fi
+# Leave the PATH block: ~/.local/bin may also contain other user commands.
 
 echo "Stopped the service and removed $PLIST"
 echo "The program directory was not deleted; remove the whole directory if you no longer need it."

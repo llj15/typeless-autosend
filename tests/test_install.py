@@ -1,6 +1,7 @@
 """install.sh and uninstall.sh in a sandbox: fake HOME, with stub swiftc and launchctl first on PATH.
 Nothing here touches the real service or the real LaunchAgents folder."""
 import json
+import glob
 import os
 import plistlib
 import re
@@ -43,7 +44,7 @@ def sandbox(sub):
     home = f"{SBX}/home-{next(_homes)}"
     d = f"{home}/{sub}"
     os.makedirs(d)
-    for f in ("install.sh", "main.swift", "config.example.json", "uninstall.sh"):
+    for f in ("install.sh", "config.example.json", "uninstall.sh", *[os.path.basename(p) for p in glob.glob(f"{ROOT}/*.swift")]):
         shutil.copy(f"{ROOT}/{f}", d)
     return home, d
 
@@ -89,6 +90,20 @@ again = run("install.sh", home, d, "--app", "com.example.three")
 check("PATH setup is idempotent", os.path.exists(profile) and open(profile).read().count("# >>> typeless-autoenter PATH >>>") == 1)
 check("--app is ignored with a notice when config.json already exists",
       "left untouched" in again.stdout and json.load(open(f"{d}/config.json"))["apps"] == ["com.example.one", "com.example.two"])
+
+uninstalled = run("uninstall.sh", home, d)
+check("uninstall removes only its own global link", uninstalled.returncode == 0 and not os.path.lexists(link_path))
+check("uninstall preserves config and harmless shared PATH setup", os.path.exists(f"{d}/config.json") and os.path.exists(profile))
+
+print("Reinstall after moving the installed directory")
+home, d = sandbox("old-location")
+first = run("install.sh", home, d)
+moved = f"{home}/new-location"
+os.rename(d, moved)
+relocated = run("install.sh", home, moved)
+check("reinstall repairs owned stale command and service path", relocated.returncode == 0 and
+      os.path.realpath(f"{home}/.local/bin/typeless-autoenter") == f"{moved}/typeless-autoenter",
+      relocated.stderr[-200:])
 
 print("Failure paths")
 home, d = sandbox("ta")
