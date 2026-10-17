@@ -27,7 +27,7 @@ let dryRun = env["TYPELESS_DRY_RUN"] == "1"
 let pasteModes: Set<String> = ["voice_transcript", "voice_translation"]
 let requiredColumns: Set<String> = ["id", "mode", "status", "refined_text", "updated_at"]
 let pollInterval: TimeInterval = 0.1
-let enterDelay: TimeInterval = Double(env["TYPELESS_ENTER_DELAY"] ?? "") ?? 0.15
+let enterDelay: TimeInterval = 0.15
 // Only look at the most recent N local records (rowid is monotonic), independent of created_at,
 // so long recordings are still caught.
 let recentRowCount = 20
@@ -140,13 +140,12 @@ func fileSig(_ path: String) -> FileSig {
 // in the -wal first and the main file's mtime only changes on checkpoint.
 func dbSignature() -> [FileSig] { [fileSig(dbPath), fileSig(dbPath + "-wal")] }
 
-struct Config: Decodable { let apps: [String] }
 enum ConfigError: Error { case missing, invalid }
 
-func readConfig() -> Result<[String], ConfigError> {
-    guard let data = FileManager.default.contents(atPath: configPath) else { return .failure(.missing) }
-    guard let config = try? JSONDecoder().decode(Config.self, from: data) else { return .failure(.invalid) }
-    return .success(config.apps)
+func readConfig() -> Result<AutoenterSettings, ConfigError> {
+    guard FileManager.default.fileExists(atPath: configPath) else { return .failure(.missing) }
+    guard let config = try? SettingsStore(path: configPath).read() else { return .failure(.invalid) }
+    return .success(config)
 }
 
 // A missing or invalid config falls back to an empty whitelist (never press Enter):
@@ -160,7 +159,8 @@ func loadTargetBundleIDs() -> Set<String> {
         result = readConfig()
     }
     switch result {
-    case .success(let apps):
+    case .success(let settings):
+        let apps = settings.apps
         if apps.isEmpty { log("config has no apps, nothing enabled: \(configPath)") }
         // Hand-written Bundle IDs are easy to get wrong in case or whitespace; normalize before comparing.
         return Set(apps.map(normalizeBundleID))
@@ -173,16 +173,11 @@ func loadTargetBundleIDs() -> Set<String> {
     }
 }
 
-func normalizeBundleID(_ id: String) -> String {
-    id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-}
-
 func frontmostIsTarget() -> (Bool, String) {
     let front: String
     if dryRun {
         // In dry run, TYPELESS_FAKE_FRONT simulates the frontmost app; if unset the check always passes.
-        guard let fake = env["TYPELESS_FAKE_FRONT"] else { return (true, "dry-run") }
-        front = fake
+        front = env["TYPELESS_FAKE_FRONT"] ?? "dry-run"
     } else {
         front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
     }
@@ -265,7 +260,8 @@ func runDoctor() -> Int32 {
         fail("Config file not found: \(configPath)")
     case .failure(.invalid):
         fail("Config file is invalid, expected {\"apps\": [\"bundle.id\", ...]}: \(configPath)")
-    case .success(let apps):
+    case .success(let settings):
+        let apps = settings.apps
         if apps.isEmpty {
             fail("config.json has no apps, so Enter is never sent; run list-apps to find Bundle IDs")
         }
@@ -303,6 +299,10 @@ func runDoctor() -> Int32 {
 }
 
 let subcommand = CommandLine.arguments.dropFirst().first
+if let result = runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: SettingsStore(path: configPath), serviceRunning: {
+    guard let result = launchctlOutput(["print", "gui/\(getuid())/\(serviceLabel)"]) else { return false }
+    return result.status == 0 && result.output.contains("state = running")
+}) { exit(result) }
 if subcommand == "list-apps" { listApps(includeAccessory: CommandLine.arguments.contains("--all")); exit(0) }
 if subcommand == "doctor" { exit(runDoctor()) }
 if let unknown = subcommand {
@@ -358,6 +358,41 @@ var failures = 0
 var tick = 0
 // While one Enter is already queued, other records in the same window fold into it instead of firing again.
 var enterPending = false
+var pendingGeneration = 0
+var pendingRowID: String?
+var pendingFocus: FocusSnapshot?
+var pendingCancellationRevisions: (global: UInt64, app: UInt64)?
+let inputMonitor = InputMonitor(dryRun: dryRun, environment: env)
+var lastSkipReason: String?
+let runtimeStatusPath = URL(fileURLWithPath: configPath).deletingLastPathComponent().appendingPathComponent("runtime-status.json")
+
+func writeRuntimeStatus() {
+    var status: [String: Any] = ["pid": getpid(), "updatedAt": isoFrac.string(from: Date()),
+        "pending": enterPending, "inputMonitoringAvailable": inputMonitor.available]
+    status["lastSkipReason"] = lastSkipReason ?? NSNull()
+    if let data = try? JSONSerialization.data(withJSONObject: status, options: [.sortedKeys]) {
+        try? data.write(to: runtimeStatusPath, options: .atomic)
+    }
+}
+
+func recordSkip(_ id: String, _ reason: String) {
+    lastSkipReason = reason
+    log("skip id=\(id) \(reason)")
+    writeRuntimeStatus()
+}
+
+func cancelPending(_ reason: String) {
+    guard enterPending, let id = pendingRowID else { return }
+    pendingGeneration += 1
+    enterPending = false
+    pendingRowID = nil
+    pendingFocus = nil
+    pendingCancellationRevisions = nil
+    inputMonitor.endAttempt()
+    recordSkip(id, reason)
+}
+inputMonitor.onKeyboard = cancelPending
+inputMonitor.onFocusChange = cancelPending
 
 func process(_ rows: [Row]) {
     guard var known = seen else {
@@ -366,35 +401,107 @@ func process(_ rows: [Row]) {
         return
     }
     defer { seen = known }
+    var scheduledThisBatch = false
 
     for row in rows where !known.contains(row.id) {
         let age = row.updatedAt.map { Date().timeIntervalSince($0) }
         let ageText = age.map { String(format: "%.1fs", $0) } ?? "?"
         let fresh = age.map { abs($0) < freshnessSeconds } ?? false
+        let settingsResult = readConfig()
+        if case .success(let settings) = settingsResult, settings.paused {
+            known.insert(row.id)
+            recordSkip(row.id, "autoenter paused")
+            continue
+        }
+        if case .success(let settings) = settingsResult, settings.resumeAfter > 0,
+           let completedAt = row.updatedAt, completedAt.timeIntervalSince1970 <= settings.resumeAfter {
+            known.insert(row.id)
+            recordSkip(row.id, "completed at or before latest resume")
+            continue
+        }
         // A record whose status turned completed before its text was written: while it is fresh, do not
         // consume it yet and wait for the text (a genuinely empty record is skipped as old once it goes stale).
         if fresh && row.textLen == 0 && pasteModes.contains(row.mode) { continue }
         known.insert(row.id)
         // Check the cheap conditions first; only then read the config and the frontmost app.
         guard pasteModes.contains(row.mode), row.textLen > 0, fresh else {
-            log("skip id=\(row.id) mode=\(row.mode) len=\(row.textLen) age=\(ageText)")
+            recordSkip(row.id, "mode=\(row.mode) len=\(row.textLen) age=\(ageText)")
             continue
         }
-        let (isTarget, front) = frontmostIsTarget()
+        let settings: AutoenterSettings
+        switch settingsResult {
+        case .success(let value): settings = value
+        case .failure(.missing): recordSkip(row.id, "config missing, no apps enabled"); continue
+        case .failure(.invalid): recordSkip(row.id, "config invalid, no apps enabled"); continue
+        }
+        if settings.apps.isEmpty { log("config has no apps, nothing enabled: \(configPath)") }
+        if enterPending {
+            if scheduledThisBatch {
+                recordSkip(row.id, "coalesced into pending enter")
+                continue
+            }
+            cancelPending("superseded by newer completed transcript")
+        }
+        let focus: FocusSnapshot
+        switch inputMonitor.beginAttempt() {
+        case .failure(let error): recordSkip(row.id, error.reason); continue
+        case .success(let snapshot): focus = snapshot
+        }
+        let front = focus.bundleID
+        let isTarget = Set(settings.apps.map(normalizeBundleID)).contains(normalizeBundleID(front))
         guard isTarget else {
-            log("skip id=\(row.id) front=\(front) not in whitelist")
+            recordSkip(row.id, "front=\(front) not in whitelist")
             continue
         }
-        guard !enterPending else {
-            log("skip id=\(row.id) coalesced into pending enter")
+        let additionalDelay = settings.effectiveDelay(for: front)
+        guard additionalDelay.isFinite, additionalDelay >= 0,
+              additionalDelay <= maximumDelaySeconds else {
+            recordSkip(row.id, "configured delay exceeds scheduler range")
             continue
         }
         enterPending = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay) {
-            defer { enterPending = false }
-            let (stillTarget, frontNow) = frontmostIsTarget()
-            guard stillTarget else {
-                log("skip id=\(row.id) front changed to \(frontNow)")
+        scheduledThisBatch = true
+        pendingRowID = row.id
+        pendingFocus = focus
+        let cancellationRevision = settings.cancellationRevision
+        let appCancellationRevision = settings.appCancellationRevisions[normalizeBundleID(front)] ?? 0
+        pendingCancellationRevisions = (cancellationRevision, appCancellationRevision)
+        inputMonitor.armAttempt(focus: focus)
+        pendingGeneration += 1
+        let generation = pendingGeneration
+        writeRuntimeStatus()
+        func deliverWhenSafe() {
+            inputMonitor.poll()
+            inputMonitor.validateMouseSelection()
+            guard generation == pendingGeneration, enterPending else { return }
+            guard inputMonitor.available else { cancelPending("input monitoring unavailable"); return }
+            if inputMonitor.mouseChecksPending > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: deliverWhenSafe)
+                return
+            }
+            defer {
+                enterPending = false
+                pendingRowID = nil
+                pendingFocus = nil
+                pendingCancellationRevisions = nil
+                inputMonitor.endAttempt()
+                writeRuntimeStatus()
+            }
+            guard case .success(let current) = inputMonitor.currentFocus(), focus.sameTarget(as: current) else {
+                recordSkip(row.id, "window/input/application focus changed or unavailable")
+                return
+            }
+            guard case .success(let latest) = readConfig(), !latest.paused,
+                  Set(latest.apps.map(normalizeBundleID)).contains(normalizeBundleID(current.bundleID)) else {
+                recordSkip(row.id, "app removed, paused or config unavailable")
+                return
+            }
+            guard latest.cancellationRevision == cancellationRevision else {
+                recordSkip(row.id, "pause was requested during countdown")
+                return
+            }
+            guard (latest.appCancellationRevisions[normalizeBundleID(front)] ?? 0) == appCancellationRevision else {
+                recordSkip(row.id, "app was removed during countdown")
                 return
             }
             if dryRun {
@@ -402,17 +509,43 @@ func process(_ rows: [Row]) {
                 return
             }
             guard AXIsProcessTrusted() else {
-                log("skip id=\(row.id) accessibility not trusted")
+                recordSkip(row.id, "accessibility not trusted")
                 return
             }
             pressEnter()
             log("enter id=\(row.id) mode=\(row.mode) len=\(row.textLen)")
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay + additionalDelay, execute: deliverWhenSafe)
     }
 }
 
 let timer = Timer(timeInterval: pollInterval, repeats: true) { _ in
+    inputMonitor.poll()
+    inputMonitor.validateMouseSelection()
+    if enterPending, !inputMonitor.available { cancelPending("input monitoring unavailable") }
+    if enterPending, let focus = pendingFocus {
+        switch inputMonitor.currentFocus() {
+        case .failure(let error): cancelPending(error.reason)
+        case .success(let current):
+            if !focus.sameTarget(as: current) { cancelPending("window/input/application focus changed") }
+        }
+        if case .success(let settings) = readConfig() {
+            if settings.paused { cancelPending("autoenter paused") }
+            else if let revisions = pendingCancellationRevisions,
+                    settings.cancellationRevision != revisions.global {
+                cancelPending("pause was requested during countdown")
+            }
+            else if let revisions = pendingCancellationRevisions,
+                    (settings.appCancellationRevisions[normalizeBundleID(focus.bundleID)] ?? 0) != revisions.app {
+                cancelPending("app was removed during countdown")
+            }
+            else if !Set(settings.apps.map(normalizeBundleID)).contains(normalizeBundleID(focus.bundleID)) {
+                cancelPending("app removed from whitelist")
+            }
+        } else { cancelPending("config unavailable") }
+    }
     tick += 1
+    if tick % 10 == 1 { writeRuntimeStatus() }
     // Check the permission state every 5 seconds and log a line when it changes
     // (doctor relies on this line to tell whether the background service has permission).
     if !dryRun && tick % 50 == 0 {

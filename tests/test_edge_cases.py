@@ -99,7 +99,7 @@ shutil.rmtree(direct, ignore_errors=True)
 os.makedirs(direct)
 os.makedirs(f"{WORK}/links", exist_ok=True)
 shutil.copy(BIN, f"{direct}/typeless-autoenter")
-open(f"{direct}/config.json", "w").write(f'{{"apps": ["{SLACK}"]}}')
+open(f"{direct}/config.json", "w").write(f'{{"apps": ["{SLACK}"], "delaySeconds": 0}}')
 link = f"{WORK}/links/via-symlink"
 if os.path.lexists(link):
     os.remove(link)
@@ -118,5 +118,5 @@ for how, binary in (("started directly", f"{direct}/typeless-autoenter"), ("star
 
 print("Unknown subcommand")
 r = subprocess.run([BIN, "bogus"], capture_output=True, text=True)
-check("exits with status 2 and prints the usage", r.returncode == 2 and "usage:" in r.stderr)
+check("exits with status 2 and points to help", r.returncode == 2 and "--help" in r.stderr)
 finish()

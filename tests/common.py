@@ -1,4 +1,5 @@
 """Shared helpers for the typeless-autoenter tests. Run everything with tests/run.sh."""
+import json
 import datetime as dt
 import os
 import sqlite3
@@ -61,6 +62,11 @@ def start(binary, db, log, cfg=None, fake_front=None, **env):
     e = dict(os.environ, TYPELESS_DB=db, TYPELESS_DRY_RUN="1")
     e.pop("TYPELESS_AUTOENTER_CONFIG", None)
     e.pop("TYPELESS_FAKE_FRONT", None)
+    if cfg is None and fake_front is None:
+        cfg = log + ".config.json"
+        fake_front = "com.test.fixture"
+        with open(cfg, "w") as config_file:
+            json.dump({"apps": [fake_front], "delaySeconds": 0}, config_file)
     if cfg:
         e["TYPELESS_AUTOENTER_CONFIG"] = cfg
     if fake_front:
