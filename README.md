@@ -1,4 +1,4 @@
-# typeless-autoenter
+# Typeless AutoSend
 
 A macOS command-line utility and login service for Apple Silicon (ARM). After Typeless finishes a transcription, it waits before pressing Return in an application you explicitly enabled. Any user keystroke or change of input focus cancels the pending send.
 
@@ -6,13 +6,15 @@ A macOS command-line utility and login service for Apple Silicon (ARM). After Ty
 
 Prerequisites: Typeless installed and signed in, history enabled, and Xcode Command Line Tools (`xcode-select --install`). This release targets macOS on Apple Silicon; Windows is not supported.
 
-Keep the repository in an unprotected directory, for example `~/Developer/typeless-autoenter`. Do not install from Desktop, Documents, Downloads, or iCloud: the background service cannot read its files there.
+Keep the repository in an unprotected directory, for example `~/Developer/typeless-autosend`. Do not install from Desktop, Documents, Downloads, or iCloud: the background service cannot read its files there.
 
 ```bash
+git clone https://github.com/llj15/typeless-autosend.git ~/Developer/typeless-autosend
+cd ~/Developer/typeless-autosend
 ./install.sh
 ```
 
-The installer builds the native executable, registers a login LaunchAgent, and links `~/.local/bin/typeless-autoenter`. If necessary it adds a marked PATH block to your zsh or bash startup file. Open a new terminal after installing. Other shells receive a manual PATH instruction.
+The installer builds the native executable, registers a login LaunchAgent, and links `~/.local/bin/typeless-autosend`. If necessary it adds a marked PATH block to your zsh or bash startup file. Open a new terminal after installing. Other shells receive a manual PATH instruction.
 
 Grant the executable Accessibility permission in System Settings → Privacy & Security → Accessibility. The service also needs permission to observe input events: check System Settings → Privacy & Security → Input Monitoring if its diagnostics report input monitoring unavailable. A rebuild can invalidate permissions: remove the old Accessibility entry and add the rebuilt executable again.
 
@@ -21,10 +23,10 @@ Fresh installations enable **no apps**. Upgrades leave your existing configurati
 ## Choose applications
 
 ```bash
-typeless-autoenter apps search Ghostty
-typeless-autoenter apps add com.mitchellh.ghostty
-typeless-autoenter apps list
-typeless-autoenter apps remove com.mitchellh.ghostty
+typeless-autosend apps search Ghostty
+typeless-autosend apps add com.mitchellh.ghostty
+typeless-autosend apps list
+typeless-autosend apps remove com.mitchellh.ghostty
 ```
 
 Search includes installed applications that are not running. Results contain the app name and Bundle ID. **`apps add` only accepts a Bundle ID**, not an application name. Adding enables the app immediately; removing disables it and removes its delay override. There is no per-app disable switch.
@@ -32,11 +34,11 @@ Search includes installed applications that are not running. Results contain the
 ## Configure the delay
 
 ```bash
-typeless-autoenter delay get
-typeless-autoenter delay set 2
-typeless-autoenter delay set 0.5 --app com.mitchellh.ghostty
-typeless-autoenter delay get --app com.mitchellh.ghostty
-typeless-autoenter delay reset --app com.mitchellh.ghostty
+typeless-autosend delay get
+typeless-autosend delay set 2
+typeless-autosend delay set 0.5 --app com.mitchellh.ghostty
+typeless-autosend delay get --app com.mitchellh.ghostty
+typeless-autosend delay reset --app com.mitchellh.ghostty
 ```
 
 The default delay is **1 second**. Nonnegative fractional seconds are supported. An app override takes precedence; resetting it makes that app follow the global value again. Global `delay reset` restores 1 second.
@@ -59,10 +61,10 @@ Typeless-generated input is excluded only when it can be attributed to Typeless.
 ## Pause and inspect
 
 ```bash
-typeless-autoenter service pause
-typeless-autoenter service resume
-typeless-autoenter service status
-typeless-autoenter doctor
+typeless-autosend service pause
+typeless-autosend service resume
+typeless-autosend service status
+typeless-autosend doctor
 ```
 
 Pause survives restarts and login; resume explicitly to enable sending again. Transcriptions completed before that resume are not replayed, even if the service was briefly stalled during the pause. Pausing or removing the pending app cancels its countdown. Changing a delay affects subsequent transcriptions only. Status includes the latest skip reason when runtime information is available.
@@ -94,10 +96,16 @@ Tests compile a separate executable and use temporary SQLite databases, simulate
 
 ## Upgrade and uninstall
 
-Update the source and rerun `./install.sh`. Reauthorize the rebuilt executable as described above.
+Update the source and rerun `./install.sh` in the existing installation directory. Reauthorize the rebuilt executable as described above.
+
+Upgrading from **typeless-autoenter** keeps `config.json` unchanged, including enabled apps, pause state, delays, overrides and cancellation revisions. The installer stops and checks the old `local.typeless-autoenter` service before starting `local.typeless-autosend`, removes the old LaunchAgent and its owned command link, and installs `typeless-autosend`. It migrates the shell PATH marker and writes new logs to `autosend.log`; old `autoenter.log` files remain available. If the old service cannot be stopped, the upgrade aborts before starting a new service.
+
+The installation directory may keep its old name. To rename it, move the **whole existing directory** and rerun `./install.sh`; do not install a separate checkout over a live installation. The existing instance lock and all configuration stay together. Update an existing clone's remote URL with `git remote set-url origin https://github.com/llj15/typeless-autosend.git`.
+
+For scripts, `TYPELESS_AUTOSEND_CONFIG` overrides the config path. The legacy `TYPELESS_AUTOENTER_CONFIG` remains a fallback; the new variable wins if both are set.
 
 ```bash
 ./uninstall.sh
 ```
 
-Uninstall stops the service, removes its LaunchAgent and removes its own command link. It preserves the repository, configuration and shared PATH block. Remove the Accessibility entry manually if no longer needed.
+Uninstall stops both current and legacy service names, removes their LaunchAgents and removes their owned command links. It preserves the repository, configuration and shared PATH block. Remove the Accessibility entry manually if no longer needed.

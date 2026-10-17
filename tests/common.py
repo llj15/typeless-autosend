@@ -1,4 +1,4 @@
-"""Shared helpers for the typeless-autoenter tests. Run everything with tests/run.sh."""
+"""Shared helpers for the typeless-autosend tests. Run everything with tests/run.sh."""
 import json
 import datetime as dt
 import os
@@ -9,7 +9,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 WORK = os.path.join(HERE, ".work")  # scratch space, git-ignored, built by run.sh
-BIN = os.path.join(WORK, "typeless-autoenter")
+BIN = os.path.join(WORK, "typeless-autosend")
 COLS = "id,status,mode,refined_text,created_at,updated_at,app_version,synced_from_cloud"
 
 _results = []
@@ -60,6 +60,7 @@ def row(conn, rid, status: "str | None" = "completed", text: "str | None" = "x",
 def start(binary, db, log, cfg=None, fake_front=None, **env):
     """Start the service in dry-run mode: it logs 'would enter' instead of pressing Return."""
     e = dict(os.environ, TYPELESS_DB=db, TYPELESS_DRY_RUN="1")
+    e.pop("TYPELESS_AUTOSEND_CONFIG", None)
     e.pop("TYPELESS_AUTOENTER_CONFIG", None)
     e.pop("TYPELESS_FAKE_FRONT", None)
     if cfg is None and fake_front is None:
@@ -68,7 +69,7 @@ def start(binary, db, log, cfg=None, fake_front=None, **env):
         with open(cfg, "w") as config_file:
             json.dump({"apps": [fake_front], "delaySeconds": 0}, config_file)
     if cfg:
-        e["TYPELESS_AUTOENTER_CONFIG"] = cfg
+        e["TYPELESS_AUTOSEND_CONFIG"] = cfg
     if fake_front:
         e["TYPELESS_FAKE_FRONT"] = fake_front
     e.update(env)

@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / "tests" / ".cli-work"
-BIN = Path(os.environ.get("TYPELESS_TEST_BINARY", str(WORK / "typeless-autoenter"))).resolve()
+BIN = Path(os.environ.get("TYPELESS_TEST_BINARY", str(WORK / "typeless-autosend"))).resolve()
 
 
 class CLITests(unittest.TestCase):
@@ -31,7 +31,7 @@ class CLITests(unittest.TestCase):
             harness = WORK / "main.swift"
             harness.write_text('''import Foundation
 import Darwin
-let path = ProcessInfo.processInfo.environment["TYPELESS_AUTOENTER_CONFIG"]!
+let path = ProcessInfo.processInfo.environment["TYPELESS_AUTOSEND_CONFIG"]!
 exit(runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: SettingsStore(path: path), serviceRunning: { false }) ?? 2)
 ''')
             sources = [str(ROOT / name) for name in ("Settings.swift", "Applications.swift", "CLI.swift")]
@@ -46,13 +46,43 @@ exit(runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: Settings
         self.config = Path(self.temp.name) / "config.json"
 
     def command(self, *args):
-        env = dict(os.environ, TYPELESS_AUTOENTER_CONFIG=str(self.config))
+        env = dict(os.environ, TYPELESS_AUTOSEND_CONFIG=str(self.config))
         return subprocess.run([str(BIN), *args], env=env, capture_output=True, text=True, timeout=10)
 
     def result(self, *args):
         completed = self.command(*args)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return json.loads(completed.stdout)
+
+    def test_public_contract_uses_typeless_autosend_name(self):
+        help_result = self.command("--help")
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("Usage: typeless-autosend ", help_result.stdout)
+        self.assertNotIn("typeless-autoenter", help_result.stdout)
+        schema = self.result("schema", "--all")
+        for command in schema["commands"]:
+            self.assertTrue(all(example.startswith("typeless-autosend ") for example in command["examples"]))
+        error = self.command("missing-command")
+        self.assertIn("typeless-autosend --help", json.loads(error.stderr)["suggestion"])
+        doctor = self.command("doctor")
+        self.assertIn("typeless-autosend doctor", doctor.stdout)
+
+    def test_new_config_override_and_legacy_fallback_preserve_settings(self):
+        self.config.write_text('{"apps":["com.example.legacy"],"paused":true}')
+        modern = Path(self.temp.name) / "new-config.json"
+        modern.write_text('{"apps":["com.example.modern"],"delaySeconds":2}')
+        environment = dict(os.environ, TYPELESS_AUTOENTER_CONFIG=str(self.config),
+                           TYPELESS_AUTOSEND_CONFIG=str(modern))
+        result = subprocess.run([str(BIN), "service", "status"], env=environment,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["configPath"], str(modern))
+        self.assertEqual(json.loads(result.stdout)["apps"], ["com.example.modern"])
+        environment.pop("TYPELESS_AUTOSEND_CONFIG")
+        legacy = subprocess.run([str(BIN), "service", "status"], env=environment,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(legacy.returncode, 0, legacy.stderr)
+        self.assertTrue(json.loads(legacy.stdout)["paused"])
 
     def test_added_bundle_id_is_immediately_enabled_and_persisted(self):
         self.result("apps", "add", "COM.Example.Chat")
@@ -199,7 +229,7 @@ exit(runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: Settings
 
     def test_parallel_app_additions_do_not_overwrite_each_other(self):
         self.config.write_text(json.dumps({"apps": [], "extensionPayload": "x" * 500000}))
-        env = dict(os.environ, TYPELESS_AUTOENTER_CONFIG=str(self.config))
+        env = dict(os.environ, TYPELESS_AUTOSEND_CONFIG=str(self.config))
         processes = [subprocess.Popen([str(BIN), "apps", "add", f"com.example.parallel{i}"], env=env,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for i in range(16)]
         for process in processes:

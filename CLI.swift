@@ -54,12 +54,12 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
         var flags = Set<String>()
         for flag in rawArguments where flag.hasPrefix("--") {
             guard allowedFlags.contains(flag), flags.insert(flag).inserted else {
-                throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unsupported or repeated option \(flag)", suggestion: "Run typeless-autoenter --help for supported options")
+                throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unsupported or repeated option \(flag)", suggestion: "Run typeless-autosend --help for supported options")
             }
         }
         func validateBundleID(_ id: String) throws {
             guard id.range(of: "^[a-z0-9-]+(?:\\.[a-z0-9-]+)+$", options: .regularExpression) != nil else {
-                throw CLIProblem(code: 2, type: "invalid_arguments", message: "Invalid Bundle ID: \(id)", suggestion: "Find an ID with typeless-autoenter apps search <name>")
+                throw CLIProblem(code: 2, type: "invalid_arguments", message: "Invalid Bundle ID: \(id)", suggestion: "Find an ID with typeless-autosend apps search <name>")
             }
         }
         if let id = appID { try validateBundleID(id) }
@@ -74,7 +74,7 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
                 cliJSON(schema)
                 return 0
             }
-            throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unknown schema command: \(path.joined(separator: " "))", suggestion: "Run typeless-autoenter schema --all")
+            throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unknown schema command: \(path.joined(separator: " "))", suggestion: "Run typeless-autosend schema --all")
         }
         if noun == "apps", arguments.count >= 2, arguments[1] == "search", arguments.count <= 3 {
             let settings = try store.read()
@@ -88,7 +88,7 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
             return 0
         }
         if arguments.count == 2, noun == "service", ["pause", "resume", "status"].contains(arguments[1]) {
-            let settings: AutoenterSettings
+            let settings: AutosendSettings
             if arguments[1] == "status" { settings = try store.read() }
             else {
                 settings = try store.update(dryRun: dryRun) {
@@ -112,7 +112,7 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
         }
         if arguments.count == 3, noun == "delay", arguments[1] == "set" {
             guard let seconds = Double(arguments[2]), seconds.isFinite, seconds >= 0, seconds <= maximumDelaySeconds else {
-                throw CLIProblem(code: 2, type: "invalid_arguments", message: "Delay must be finite and in scheduler range 0...\(maximumDelaySeconds) seconds", suggestion: "Use a nonnegative delay such as typeless-autoenter delay set 1")
+                throw CLIProblem(code: 2, type: "invalid_arguments", message: "Delay must be finite and in scheduler range 0...\(maximumDelaySeconds) seconds", suggestion: "Use a nonnegative delay such as typeless-autosend delay set 1")
             }
             let settings = try store.update(dryRun: dryRun) {
                 if let id = appID { $0.appDelaySeconds[id] = seconds }
@@ -167,7 +167,7 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
             emit(["bundleID": id, "enabled": false, "dryRun": dryRun, "changed": changed])
             return dryRun ? 10 : 0
         }
-        throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unknown command or invalid arguments", suggestion: "Run typeless-autoenter --help")
+        throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unknown command or invalid arguments", suggestion: "Run typeless-autosend --help")
     } catch let error as CLIProblem {
         cliJSON(["error": error.type, "message": error.message, "suggestion": error.suggestion, "retryable": false, "input": rawArguments], error: true)
         return error.code
@@ -224,7 +224,7 @@ private func cliCommandSchemas() -> [[String: Any]] {
         ("list-apps", "List running apps (legacy command)", [], [["name": "--all", "type": "boolean", "required": false, "default": false]], "list-apps --all")
     ]
     return entries.map { name, description, arguments, flags, example in
-        ["name": name, "description": description, "arguments": arguments, "flags": (["doctor", "list-apps"].contains(name) ? [] : common) + flags, "examples": ["typeless-autoenter " + example]]
+        ["name": name, "description": description, "arguments": arguments, "flags": (["doctor", "list-apps"].contains(name) ? [] : common) + flags, "examples": ["typeless-autosend " + example]]
     }
 }
 
@@ -235,9 +235,9 @@ private func cliHelp(path: [String]) throws -> String {
         return target.isEmpty || name == target || name.hasPrefix(target + " ")
     }
     guard !schemas.isEmpty else {
-        throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unknown help command: \(target)", suggestion: "Run typeless-autoenter --help")
+        throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unknown help command: \(target)", suggestion: "Run typeless-autosend --help")
     }
-    var lines = ["Examples:", "  typeless-autoenter apps search TextEdit", "  typeless-autoenter apps add com.apple.TextEdit", "  typeless-autoenter delay set 0.5", "", "Usage: typeless-autoenter " + (target.isEmpty ? "<resource> <action>" : target), ""]
+    var lines = ["Examples:", "  typeless-autosend apps search TextEdit", "  typeless-autosend apps add com.apple.TextEdit", "  typeless-autosend delay set 0.5", "", "Usage: typeless-autosend " + (target.isEmpty ? "<resource> <action>" : target), ""]
     for schema in schemas {
         lines.append("  \(schema["name"] as? String ?? ""): \(schema["description"] as? String ?? "")")
     }
@@ -250,7 +250,7 @@ private func cliHelp(path: [String]) throws -> String {
         let names = flags.compactMap { $0["name"] as? String }.filter { !["--json", "--format", "--help"].contains($0) }
         if !names.isEmpty { lines.append("Optional flags: " + names.joined(separator: ", ")) }
     }
-    lines += ["", "Schema: typeless-autoenter schema --all | schema <resource> <action>", "Exit codes: 0 success; 1 config/I/O; 2 usage; 3 not found; 4 permission; 5 exists; 10 dry-run", ""]
+    lines += ["", "Schema: typeless-autosend schema --all | schema <resource> <action>", "Exit codes: 0 success; 1 config/I/O; 2 usage; 3 not found; 4 permission; 5 exists; 10 dry-run", ""]
     return lines.joined(separator: "\n")
 }
 
@@ -277,7 +277,7 @@ private func cliTableValue(_ value: Any?) -> String {
     return String(describing: value)
 }
 
-private func delayResult(_ settings: AutoenterSettings, appID: String?) -> [String: Any] {
+private func delayResult(_ settings: AutosendSettings, appID: String?) -> [String: Any] {
     ["scope": appID == nil ? "global" : "app", "bundleID": appID as Any? ?? NSNull(),
      "delaySeconds": appID.map { settings.effectiveDelay(for: $0) } ?? settings.delaySeconds,
      "globalDelaySeconds": settings.delaySeconds,

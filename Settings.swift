@@ -9,7 +9,7 @@ func normalizeBundleID(_ id: String) -> String {
     id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 }
 
-struct AutoenterSettings: Codable {
+struct AutosendSettings: Codable {
     var apps: [String] = []
     var delaySeconds: Double = 1
     var appDelaySeconds: [String: Double] = [:]
@@ -150,15 +150,15 @@ private func unknownSettingsFields(in data: Data) throws -> [String: Data] {
 struct SettingsStore {
     let path: String
 
-    func read() throws -> AutoenterSettings {
-        guard FileManager.default.fileExists(atPath: path) else { return AutoenterSettings() }
+    func read() throws -> AutosendSettings {
+        guard FileManager.default.fileExists(atPath: path) else { return AutosendSettings() }
         let data = try utf8SettingsData(Data(contentsOf: URL(fileURLWithPath: path)))
-        var settings = try JSONDecoder().decode(AutoenterSettings.self, from: data)
+        var settings = try JSONDecoder().decode(AutosendSettings.self, from: data)
         settings.unknownFields = try unknownSettingsFields(in: data)
         return settings
     }
 
-    func update(dryRun: Bool = false, _ mutate: (inout AutoenterSettings) throws -> Void) throws -> AutoenterSettings {
+    func update(dryRun: Bool = false, _ mutate: (inout AutosendSettings) throws -> Void) throws -> AutosendSettings {
         if dryRun {
             var settings = try read()
             try mutate(&settings)

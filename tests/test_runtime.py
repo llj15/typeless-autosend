@@ -12,16 +12,16 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-BINARY = Path(os.environ.get("TYPELESS_TEST_BINARY", HERE / ".work/typeless-autoenter"))
+BINARY = Path(os.environ.get("TYPELESS_TEST_BINARY", HERE / ".work/typeless-autosend"))
 APP = "com.example.editor"
 OTHER = "com.example.chat"
 
 
 class Runtime(unittest.TestCase):
     def setUp(self):
-        self.scratch = tempfile.TemporaryDirectory(prefix="autoenter-runtime-")
+        self.scratch = tempfile.TemporaryDirectory(prefix="autosend-runtime-")
         self.directory = Path(self.scratch.name)
-        self.binary = self.directory / "typeless-autoenter"
+        self.binary = self.directory / "typeless-autosend"
         shutil.copy2(BINARY, self.binary)
         self.config = self.directory / "config.json"
         self.events = self.directory / "events.jsonl"
@@ -47,7 +47,7 @@ class Runtime(unittest.TestCase):
 
     def start(self, **extra):
         environment = dict(os.environ, TYPELESS_DB=str(self.directory / "typeless.db"),
-                           TYPELESS_AUTOENTER_CONFIG=str(self.config), TYPELESS_DRY_RUN="1",
+                           TYPELESS_AUTOSEND_CONFIG=str(self.config), TYPELESS_DRY_RUN="1",
                            TYPELESS_FAKE_FRONT=APP, TYPELESS_TEST_EVENTS=str(self.events), **extra)
         self.output = self.log.open("w")
         self.addCleanup(self.output.close)
@@ -71,7 +71,7 @@ class Runtime(unittest.TestCase):
         try:
             for command in commands:
                 result = subprocess.run([self.binary, *command], capture_output=True, text=True,
-                    env=dict(os.environ, TYPELESS_AUTOENTER_CONFIG=str(self.config)), timeout=5)
+                    env=dict(os.environ, TYPELESS_AUTOSEND_CONFIG=str(self.config)), timeout=5)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         finally:
             self.process.send_signal(signal.SIGCONT)
@@ -301,11 +301,11 @@ class Runtime(unittest.TestCase):
         self.process.send_signal(signal.SIGSTOP)
         try:
             pause = subprocess.run([self.binary, "service", "pause"], capture_output=True, text=True,
-                env=dict(os.environ, TYPELESS_AUTOENTER_CONFIG=str(self.config)), timeout=5)
+                env=dict(os.environ, TYPELESS_AUTOSEND_CONFIG=str(self.config)), timeout=5)
             self.assertEqual(pause.returncode, 0, pause.stdout + pause.stderr)
             self.complete("completed-while-paused")
             resume = subprocess.run([self.binary, "service", "resume"], capture_output=True, text=True,
-                env=dict(os.environ, TYPELESS_AUTOENTER_CONFIG=str(self.config)), timeout=5)
+                env=dict(os.environ, TYPELESS_AUTOSEND_CONFIG=str(self.config)), timeout=5)
             self.assertEqual(resume.returncode, 0, resume.stdout + resume.stderr)
         finally:
             self.process.send_signal(signal.SIGCONT)

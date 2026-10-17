@@ -1,10 +1,10 @@
-// typeless-autoenter: after Typeless finishes a transcription and pastes it, press Return once
+// typeless-autosend: after Typeless finishes a transcription and pastes it, press Return once
 // if the frontmost app is on the config.json whitelist.
 // Signal source: a new completed record appearing in history_v2 of Typeless's typeless.db.
 //
-//   typeless-autoenter            run as the background service (registered as a LaunchAgent by install.sh)
-//   typeless-autoenter doctor     self-check: Typeless, database, config, permission, service
-//   typeless-autoenter list-apps  list the Bundle IDs of running apps, for filling in config.json
+//   typeless-autosend            run as the background service (registered as a LaunchAgent by install.sh)
+//   typeless-autosend doctor     self-check: Typeless, database, config, permission, service
+//   typeless-autosend list-apps  list the Bundle IDs of running apps, for filling in config.json
 import AppKit
 import ApplicationServices
 import Foundation
@@ -18,10 +18,11 @@ let programDir = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.
 let dbPath = env["TYPELESS_DB"] ?? NSHomeDirectory() + "/Library/Application Support/Typeless/typeless.db"
 // The app whitelist lives in the config file and is re-read on every trigger,
 // so edits need no restart, rebuild or re-authorization.
-let configPath = env["TYPELESS_AUTOENTER_CONFIG"] ?? programDir + "/config.json"
-let logPath = programDir + "/autoenter.log"
+// Prefer the new override while accepting existing scripts during migration.
+let configPath = env["TYPELESS_AUTOSEND_CONFIG"] ?? env["TYPELESS_AUTOENTER_CONFIG"] ?? programDir + "/config.json"
+let logPath = programDir + "/autosend.log"
 let promptMarkerPath = programDir + "/.access-prompted"
-let serviceLabel = "local.typeless-autoenter"
+let serviceLabel = "local.typeless-autosend"
 // Dry run: skip the real frontmost-app check and never press a key, only log (for tests).
 let dryRun = env["TYPELESS_DRY_RUN"] == "1"
 let pasteModes: Set<String> = ["voice_transcript", "voice_translation"]
@@ -142,7 +143,7 @@ func dbSignature() -> [FileSig] { [fileSig(dbPath), fileSig(dbPath + "-wal")] }
 
 enum ConfigError: Error { case missing, invalid }
 
-func readConfig() -> Result<AutoenterSettings, ConfigError> {
+func readConfig() -> Result<AutosendSettings, ConfigError> {
     guard FileManager.default.fileExists(atPath: configPath) else { return .failure(.missing) }
     guard let config = try? SettingsStore(path: configPath).read() else { return .failure(.invalid) }
     return .success(config)
@@ -228,7 +229,7 @@ func runDoctor() -> Int32 {
     func warn(_ msg: String) { print("  ! \(msg)") }
     func fail(_ msg: String) { print("  ✗ \(msg)"); failures += 1 }
 
-    print("typeless-autoenter doctor (\(programDir))")
+    print("typeless-autosend doctor (\(programDir))")
 
     let appPaths = ["/Applications/Typeless.app", NSHomeDirectory() + "/Applications/Typeless.app"]
     if appPaths.contains(where: { FileManager.default.fileExists(atPath: $0) }) {
@@ -281,7 +282,7 @@ func runDoctor() -> Int32 {
         if line.contains("accessibility trusted=true") {
             ok("Background service has Accessibility permission")
         } else {
-            fail("Background service lacks Accessibility permission: System Settings → Privacy & Security → Accessibility. If typeless-autoenter is already listed, remove it with − first, then add \(programDir)/typeless-autoenter with +")
+            fail("Background service lacks Accessibility permission: System Settings → Privacy & Security → Accessibility. If typeless-autosend is already listed, remove it with − first, then add \(programDir)/typeless-autosend with +")
         }
     } else {
         warn("No Accessibility record from the service in the log yet (has it ever started?)")
@@ -306,7 +307,7 @@ if let result = runCLI(arguments: Array(CommandLine.arguments.dropFirst()), stor
 if subcommand == "list-apps" { listApps(includeAccessory: CommandLine.arguments.contains("--all")); exit(0) }
 if subcommand == "doctor" { exit(runDoctor()) }
 if let unknown = subcommand {
-    FileHandle.standardError.write(Data("unknown command: \(unknown)\nusage: typeless-autoenter [doctor|list-apps [--all]]\n".utf8))
+    FileHandle.standardError.write(Data("unknown command: \(unknown)\nusage: typeless-autosend [doctor|list-apps [--all]]\n".utf8))
     exit(2)
 }
 
@@ -410,7 +411,7 @@ func process(_ rows: [Row]) {
         let settingsResult = readConfig()
         if case .success(let settings) = settingsResult, settings.paused {
             known.insert(row.id)
-            recordSkip(row.id, "autoenter paused")
+            recordSkip(row.id, "autosend paused")
             continue
         }
         if case .success(let settings) = settingsResult, settings.resumeAfter > 0,
@@ -428,7 +429,7 @@ func process(_ rows: [Row]) {
             recordSkip(row.id, "mode=\(row.mode) len=\(row.textLen) age=\(ageText)")
             continue
         }
-        let settings: AutoenterSettings
+        let settings: AutosendSettings
         switch settingsResult {
         case .success(let value): settings = value
         case .failure(.missing): recordSkip(row.id, "config missing, no apps enabled"); continue
@@ -530,7 +531,7 @@ let timer = Timer(timeInterval: pollInterval, repeats: true) { _ in
             if !focus.sameTarget(as: current) { cancelPending("window/input/application focus changed") }
         }
         if case .success(let settings) = readConfig() {
-            if settings.paused { cancelPending("autoenter paused") }
+            if settings.paused { cancelPending("autosend paused") }
             else if let revisions = pendingCancellationRevisions,
                     settings.cancellationRevision != revisions.global {
                 cancelPending("pause was requested during countdown")

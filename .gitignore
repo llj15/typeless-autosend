@@ -1,7 +1,11 @@
 # Build output and runtime files for this machine
+/typeless-autosend
+# Legacy build/log artifacts kept during migration
 /typeless-autoenter
 /.build/
+/autosend.log
 /autoenter.log
+/autosend.log.1
 /autoenter.log.1
 /.access-prompted
 /.lock
