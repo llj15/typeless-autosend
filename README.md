@@ -1,67 +1,88 @@
 # typeless-autoenter
 
-After Typeless finishes a transcription and pastes the text into the input box, press Return once to send it. Works only in the apps you choose. macOS only.
-
-## How it works
-
-Typeless has no official hook. Every time a transcription finishes, it writes a record to a local SQLite database (`~/Library/Application Support/Typeless/typeless.db`). This program checks every 100 ms whether the database files have changed, and reads the database only when they have. When it sees a new "completed" record and the frontmost app is on the whitelist, it waits 150 ms and sends one Return.
-
-## Prerequisites
-
-- macOS, with Typeless installed and signed in
-- Xcode Command Line Tools: `xcode-select --install` (the install script builds on your machine)
-- Keep this directory somewhere unprotected, for example `~/Developer/typeless-autoenter`. **Do not put it in Desktop, Documents, Downloads or iCloud**: the background service cannot read files there (`install.sh` refuses to install).
-- Keep Typeless history turned on (it is kept forever by default; `doctor` checks this)
+A macOS command-line utility and login service for Apple Silicon (ARM). After Typeless finishes a transcription, it waits before pressing Return in an application you explicitly enabled. Any user keystroke or change of input focus cancels the pending send.
 
 ## Install
 
+Prerequisites: Typeless installed and signed in, history enabled, and Xcode Command Line Tools (`xcode-select --install`). This release targets macOS on Apple Silicon; Windows is not supported.
+
+Keep the repository in an unprotected directory, for example `~/Developer/typeless-autoenter`. Do not install from Desktop, Documents, Downloads, or iCloud: the background service cannot read its files there.
+
 ```bash
-./install.sh --app com.mitchellh.ghostty    # --app can be repeated; writes the whitelist on first install
+./install.sh
 ```
 
-The script builds the binary, generates and loads a LaunchAgent (`local.typeless-autoenter`, starts at login), creates `config.json`, and runs a self-check. The program, config and log all live in this directory, so **do not move it after installing**; if you do, re-run `./install.sh`.
+The installer builds the native executable, registers a login LaunchAgent, and links `~/.local/bin/typeless-autoenter`. If necessary it adds a marked PATH block to your zsh or bash startup file. Open a new terminal after installing. Other shells receive a manual PATH instruction.
 
-### Grant Accessibility permission (required)
+Grant the executable Accessibility permission in System Settings → Privacy & Security → Accessibility. The service also needs permission to observe input events: check System Settings → Privacy & Security → Input Monitoring if its diagnostics report input monitoring unavailable. A rebuild can invalidate permissions: remove the old Accessibility entry and add the rebuilt executable again.
 
-Sending Return needs Accessibility permission. The first start after installing shows a prompt once; turn on `typeless-autoenter` in System Settings → Privacy & Security → Accessibility.
+Fresh installations enable **no apps**. Upgrades leave your existing configuration intact. The program, config and log remain in the repository directory. After moving it, run `./install.sh` again to update the service and command link.
 
-If no prompt appears, or an old entry is already listed: remove it with `−`, then add the `typeless-autoenter` in this directory with `+`.
+## Choose applications
 
-## Configuration: `config.json`
+```bash
+typeless-autoenter apps search Ghostty
+typeless-autoenter apps add com.mitchellh.ghostty
+typeless-autoenter apps list
+typeless-autoenter apps remove com.mitchellh.ghostty
+```
+
+Search includes installed applications that are not running. Results contain the app name and Bundle ID. **`apps add` only accepts a Bundle ID**, not an application name. Adding enables the app immediately; removing disables it and removes its delay override. There is no per-app disable switch.
+
+## Configure the delay
+
+```bash
+typeless-autoenter delay get
+typeless-autoenter delay set 2
+typeless-autoenter delay set 0.5 --app com.mitchellh.ghostty
+typeless-autoenter delay get --app com.mitchellh.ghostty
+typeless-autoenter delay reset --app com.mitchellh.ghostty
+```
+
+The default delay is **1 second**. Nonnegative fractional seconds are supported. An app override takes precedence; resetting it makes that app follow the global value again. Global `delay reset` restores 1 second.
+
+A fixed 150 ms paste buffer comes before the configured delay. A value of `0` removes the extra waiting period, not that buffer. Timing starts when the database completion is detected; Typeless has no official completion hook and this is not proof that pasting has finished.
+
+## Cancellation rules
+
+During the wait:
+
+- Every real key press, including Fn and modifier keys, cancels this send permanently.
+- Switching applications, windows or input controls cancels it, even if the new application is also enabled.
+- A mouse click cancels it when the click changes the caret, selection or input focus. Clicking the same position without changing any of those does not cancel it. Moving the mouse or scrolling alone does not cancel it.
+- Starting another dictation with Fn cancels the old send immediately. When a new transcription completes, a new countdown can start; canceling or failing the dictation does not send the old text.
+- Cancellation is permanent for that attempt: returning focus or stopping typing does not restart it. Send manually or finish a new transcription.
+- If reliable focus/input inspection is unavailable, the service skips this attempt, records a reason, and checks again on the next transcription.
+
+Typeless-generated input is excluded only when it can be attributed to Typeless. Unattributed keyboard events cancel conservatively. Application Accessibility support varies; terminal editors or custom controls may not expose the caret information required to enable automatic sending. Redundant or ambiguous Accessibility focus notifications are treated conservatively: even an apparently unchanged click can cancel if the app does not provide enough information to rule out an intervening focus change.
+
+## Pause and inspect
+
+```bash
+typeless-autoenter service pause
+typeless-autoenter service resume
+typeless-autoenter service status
+typeless-autoenter doctor
+```
+
+Pause survives restarts and login; resume explicitly to enable sending again. Transcriptions completed before that resume are not replayed, even if the service was briefly stalled during the pause. Pausing or removing the pending app cancels its countdown. Changing a delay affects subsequent transcriptions only. Status includes the latest skip reason when runtime information is available.
+
+## Configuration and scripting
+
+Commands update the sibling `config.json` atomically. Existing apps-only configurations are supported and unknown fields are preserved. The service reloads settings without a restart. Use the CLI for cancellation guarantees: pause and removal commands leave a durable cancellation revision even if immediately reversed. Direct hand-edits are sampled approximately every 100 ms, so intermediate edits that are reverted before the next sample cannot be guaranteed to cancel a countdown.
 
 ```json
 {
-  "apps": [
-    "com.mitchellh.ghostty",
-    "com.tinyspeck.slackmacgap"
-  ]
+  "apps": ["com.mitchellh.ghostty"],
+  "delaySeconds": 1,
+  "appDelaySeconds": {"com.mitchellh.ghostty": 2},
+  "paused": false
 }
 ```
 
-- `config.json` is the only source of the whitelist. It is re-read every time a transcription finishes, so edits take effect immediately with no restart.
-- To find a Bundle ID: open the target app, then run `./typeless-autoenter list-apps`. Menu-bar and launcher apps (Raycast, Alfred, ...) are only listed with `--all`.
-- Matching is case-insensitive and ignores leading and trailing whitespace.
-- A missing or invalid file, or an empty `apps`, means Return is never sent in any app; the reason is written to `autoenter.log` (`config missing` / `config invalid` / `config has no apps`).
-- Code editors are not recommended: with the cursor in the code area, Return just inserts a newline.
+Use `--help` for commands and `--json` or `--format json` for structured output. Noninteractive output defaults to JSON. Mutation commands support `--dry-run` (preview only, exit 10). `apps add --if-not-exists` and `apps remove --if-exists` allow safe repetition. `schema` describes the command interface. The older `list-apps [--all]` command still lists running apps for compatibility.
 
-## Self-check
-
-```bash
-./typeless-autoenter doctor
-```
-
-Checks Typeless, the database and its schema, the history retention setting, the whitelist, and the background service's permission and running state.
-
-## Upgrade
-
-Update the source, then re-run `./install.sh`. The binary changes, so the Accessibility permission goes stale: remove the old entry and add it again, as described above.
-
-## Known limitations
-
-- Return is sent a fixed 150 ms after the record is seen, and there is no way to confirm that Typeless has finished pasting. If the paste fails or is unusually slow, an empty Return may be sent.
-- It depends on Typeless's local database schema. If a Typeless upgrade changes the schema, the program stops triggering and writes `db read failing: ...` to the log.
-- The Accessibility permission has to be redone after every rebuild.
-- Only one instance runs at a time (`.lock` in this directory). A second instance waits up to 5 seconds for the lock, then exits. To try it by hand, first stop the background service with `./uninstall.sh`.
+Exit codes: 0 success, 1 general/config error, 2 invalid arguments, 3 not found, 4 permission denied, 5 conflict, 10 successful dry-run. Diagnostics go to stderr; command data goes to stdout. Legacy `doctor` and `list-apps` retain their original text output.
 
 ## Tests
 
@@ -69,12 +90,14 @@ Update the source, then re-run `./install.sh`. The binary changes, so the Access
 tests/run.sh
 ```
 
-Builds a separate binary and runs every `tests/test_*.py` (needs the Xcode Command Line Tools and `python3`). The tests use dry-run mode, throw-away databases and a sandboxed `HOME` with stub `swiftc` and `launchctl`, so they never touch an installed service. They take a few minutes; logs are kept in `tests/.work` only when something fails.
+Tests compile a separate executable and use temporary SQLite databases, simulated system events and dry-run sends. Installer tests use a sandboxed HOME and stub system commands. They do not install the actual service or press Return in real applications. The tests validate the CLI, daemon behavior and installer boundaries; they do not certify Accessibility behavior in every real application.
 
-## Uninstall
+## Upgrade and uninstall
+
+Update the source and rerun `./install.sh`. Reauthorize the rebuilt executable as described above.
 
 ```bash
 ./uninstall.sh
 ```
 
-Stops the service and removes the LaunchAgent. The directory is not deleted, and the entry in the Accessibility list has to be removed by hand.
+Uninstall stops the service, removes its LaunchAgent and removes its own command link. It preserves the repository, configuration and shared PATH block. Remove the Accessibility entry manually if no longer needed.

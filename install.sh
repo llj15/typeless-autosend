@@ -88,7 +88,7 @@ if [ ! -f config.json ]; then
     cp config.example.json config.json
   fi
 elif [ ${#apps[@]} -gt 0 ]; then
-  echo "Note: config.json already exists and was left untouched; --app was ignored. Edit config.json directly."
+  echo "Note: config.json already exists and was left untouched; --app was ignored. Use typeless-autoenter apps add/remove to update it."
 fi
 
 # The first start after a (re)install shows the Accessibility prompt once.
@@ -194,7 +194,9 @@ Next steps:
      If no prompt appeared, or an old entry is already listed (entries go stale after an upgrade):
      remove it with −, then add this file with +
      $DIR/typeless-autoenter
-  2. Put the apps that should get the automatic Enter into the apps array in $DIR/config.json.
-     Run ./typeless-autoenter list-apps to see the Bundle IDs of running apps.
-  3. Run ./typeless-autoenter doctor at any time to check the status. Log: $DIR/autoenter.log
+  2. Find installed applications: typeless-autoenter apps search <name>
+     Enable one by Bundle ID: typeless-autoenter apps add <bundle.id>
+  3. Configure the delay: typeless-autoenter delay set 1
+     Pause/resume: typeless-autoenter service pause / service resume
+  4. Check: typeless-autoenter service status / doctor. Log: $DIR/autoenter.log
 EOF
