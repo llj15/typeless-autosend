@@ -45,6 +45,16 @@ if [ ! -d /Applications/Typeless.app ] && [ ! -d "$HOME/Applications/Typeless.ap
   echo "Warning: Typeless.app not found; continuing anyway (ignore this if it lives elsewhere)"
 fi
 
+# Never replace a command owned by another installation or tool.
+BIN_DIR="$HOME/.local/bin"
+COMMAND_LINK="$BIN_DIR/typeless-autoenter"
+if [ -e "$COMMAND_LINK" ] || [ -L "$COMMAND_LINK" ]; then
+  if [ ! -L "$COMMAND_LINK" ] || [ "$(readlink "$COMMAND_LINK")" != "$DIR/typeless-autoenter" ]; then
+    echo "Command already exists: $COMMAND_LINK. Remove or relocate it before installing." >&2
+    exit 1
+  fi
+fi
+
 echo "==> Building"
 # Build into a temp directory first, then replace: no half-written binary is left behind,
 # and the code-signing identifier stays typeless-autoenter.
@@ -131,6 +141,38 @@ for _ in $(seq 1 20); do
   grep -qs "started," autoenter.log && break
   sleep 0.5
 done
+
+echo "==> Installing command in $BIN_DIR"
+mkdir -p "$BIN_DIR"
+if [ ! -L "$COMMAND_LINK" ]; then ln -s "$DIR/typeless-autoenter" "$COMMAND_LINK"; fi
+# Configure only the login user's shell. Never duplicate our marked block.
+case "${SHELL:-/bin/zsh}" in
+  */zsh) SHELL_PROFILE="${ZDOTDIR:-$HOME}/.zshrc" ;;
+  */bash) SHELL_PROFILE="$HOME/.bash_profile" ;;
+  *) SHELL_PROFILE="" ;;
+esac
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *)
+    if [ -n "$SHELL_PROFILE" ]; then
+      if ! grep -Fq '# >>> typeless-autoenter PATH >>>' "$SHELL_PROFILE" 2>/dev/null; then
+        mkdir -p "$(dirname "$SHELL_PROFILE")"
+        cat >> "$SHELL_PROFILE" <<'PATH_BLOCK'
+
+# >>> typeless-autoenter PATH >>>
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+# <<< typeless-autoenter PATH <<<
+PATH_BLOCK
+      fi
+      echo "Open a new terminal, or source: $SHELL_PROFILE"
+    else
+      echo 'Add $HOME/.local/bin to your shell PATH to use the command from any directory.'
+    fi
+    ;;
+esac
 
 echo "==> Self-check"
 ./typeless-autoenter doctor || true

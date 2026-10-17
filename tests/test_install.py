@@ -49,7 +49,7 @@ def sandbox(sub):
 
 
 def run(script, home, d, *args, **extra):
-    env = dict(os.environ, HOME=home, PATH=f"{STUBS}:/usr/bin:/bin", SBX_LOG=f"{home}/launchctl.log", SBX_APPDIR=d)
+    env = dict(os.environ, HOME=home, PATH=f"{STUBS}:/usr/bin:/bin", SHELL="/bin/zsh", SBX_LOG=f"{home}/launchctl.log", SBX_APPDIR=d)
     env.update(extra)
     return subprocess.run(["/bin/bash", script, *args], cwd=d, env=env, capture_output=True, text=True)
 
@@ -77,7 +77,16 @@ check("the old log is kept as autoenter.log.1 and the new log starts fresh",
 check("the binary is in place and nothing is left in .build",
       os.access(f"{d}/typeless-autoenter", os.X_OK) and not os.path.exists(f"{d}/.build/typeless-autoenter"))
 check("output is English", "==> Building" in r.stdout and "Next steps:" in r.stdout and not CJK.search(r.stdout + r.stderr))
+link_path = f"{home}/.local/bin/typeless-autoenter"
+check("installs globally callable link", os.path.islink(link_path) and os.path.realpath(link_path) == f"{real}/typeless-autoenter")
+profile = f"{home}/.zshrc"
+profile_text = open(profile).read() if os.path.exists(profile) else ""
+check("adds marked PATH setup for zsh", "# >>> typeless-autoenter PATH >>>" in profile_text)
+shell = subprocess.run(["/bin/zsh", "-c", 'source "$HOME/.zshrc"; command -v typeless-autoenter'],
+                       env=dict(os.environ, HOME=home, PATH="/usr/bin:/bin"), capture_output=True, text=True)
+check("new shell can find global command", shell.returncode == 0 and shell.stdout.strip() == link_path)
 again = run("install.sh", home, d, "--app", "com.example.three")
+check("PATH setup is idempotent", os.path.exists(profile) and open(profile).read().count("# >>> typeless-autoenter PATH >>>") == 1)
 check("--app is ignored with a notice when config.json already exists",
       "left untouched" in again.stdout and json.load(open(f"{d}/config.json"))["apps"] == ["com.example.one", "com.example.two"])
 
