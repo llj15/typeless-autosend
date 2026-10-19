@@ -132,8 +132,8 @@ if [ -L "$LEGACY_LINK" ] &&
 fi
 if [ "$REMOVE_LEGACY_BINARY" -eq 1 ]; then rm -f "$DIR/typeless-autoenter"; fi
 
-# The first start after a (re)install shows the Accessibility prompt once.
-rm -f .access-prompted
+# The first start after a (re)install requests any missing permissions once.
+rm -f .access-prompted .input-monitoring-prompted
 # Switch to a fresh log file so the self-check only sees records from this start,
 # not the permission state left behind by the previous binary.
 if [ -f autosend.log ]; then mv -f autosend.log autosend.log.1; fi

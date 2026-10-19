@@ -63,6 +63,7 @@ print("Normal install (directory with a space, two --app flags)")
 home, d = sandbox("My Tools/typeless-autosend")
 real = os.path.realpath(d)
 open(f"{d}/.access-prompted", "w").close()
+open(f"{d}/.input-monitoring-prompted", "w").close()
 open(f"{d}/autosend.log", "w").write("old-log\n")
 r = run("install.sh", home, d, "--app", "com.example.one", "--app", "com.example.two")
 check("exits 0", r.returncode == 0, r.stderr[-200:])
@@ -77,6 +78,8 @@ calls = open(f"{home}/launchctl.log").read().splitlines()
 check("both service names are stopped and checked before enable/bootstrap",
       calls == [f"bootout gui/{UID}/local.typeless-autoenter", f"print gui/{UID}/local.typeless-autoenter", f"bootout gui/{UID}/{LABEL}", f"print gui/{UID}/{LABEL}", f"enable gui/{UID}/{LABEL}", f"bootstrap gui/{UID} {plist_path}"], repr(calls))
 check(".access-prompted is cleared so the next start prompts once", not os.path.exists(f"{d}/.access-prompted"))
+check(".input-monitoring-prompted is cleared so reinstall can request permission again",
+      not os.path.exists(f"{d}/.input-monitoring-prompted"))
 check("the old log is kept as autosend.log.1 and the new log starts fresh",
       open(f"{d}/autosend.log.1").read() == "old-log\n" and "started," in open(f"{d}/autosend.log").read())
 check("the binary is in place and nothing is left in .build",

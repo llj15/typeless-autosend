@@ -8,6 +8,7 @@
 /autosend.log.1
 /autoenter.log.1
 /.access-prompted
+/.input-monitoring-prompted
 /.lock
 # Personal whitelist; see config.example.json for the template
 /config.json

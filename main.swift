@@ -22,6 +22,7 @@ let dbPath = env["TYPELESS_DB"] ?? NSHomeDirectory() + "/Library/Application Sup
 let configPath = env["TYPELESS_AUTOSEND_CONFIG"] ?? env["TYPELESS_AUTOENTER_CONFIG"] ?? programDir + "/config.json"
 let logPath = programDir + "/autosend.log"
 let promptMarkerPath = programDir + "/.access-prompted"
+let inputPromptMarkerPath = programDir + "/.input-monitoring-prompted"
 let serviceLabel = "local.typeless-autosend"
 // Dry run: skip the real frontmost-app check and never press a key, only log (for tests).
 let dryRun = env["TYPELESS_DRY_RUN"] == "1"
@@ -365,6 +366,10 @@ if dryRun {
         // restarts do not prompt again, to avoid nagging.
         FileManager.default.createFile(atPath: promptMarkerPath, contents: nil)
         _ = accessibilityTrusted(prompt: true)
+    }
+    if !CGPreflightListenEventAccess() && !FileManager.default.fileExists(atPath: inputPromptMarkerPath) {
+        FileManager.default.createFile(atPath: inputPromptMarkerPath, contents: nil)
+        _ = CGRequestListenEventAccess()
     }
     log("started, accessibility trusted=\(lastTrusted), enterDelay=\(enterDelay)s, config=\(configPath)")
 }
