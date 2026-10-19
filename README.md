@@ -56,7 +56,7 @@ During the wait:
 - Cancellation is permanent for that attempt: returning focus or stopping typing does not restart it. Send manually or finish a new transcription.
 - If reliable focus/input inspection is unavailable, the service skips this attempt, records a reason, and checks again on the next transcription.
 
-Typeless-generated input is excluded only when it can be attributed to Typeless. Unattributed keyboard events cancel conservatively. Application Accessibility support varies; terminal editors or custom controls may not expose the caret information required to enable automatic sending. Redundant or ambiguous Accessibility focus notifications are treated conservatively: even an apparently unchanged click can cancel if the app does not provide enough information to rule out an intervening focus change.
+Typeless-generated input is excluded only when it can be attributed to Typeless. Unattributed keyboard events cancel conservatively. Application Accessibility support varies; terminal editors or custom controls may not expose the caret information required to enable automatic sending. Redundant Accessibility focus notifications do not cancel when both the notified target and the current focus match the original target. A notification identifying another target still cancels, even if focus has already returned; unreadable focus also cancels.
 
 ## Pause and inspect
 

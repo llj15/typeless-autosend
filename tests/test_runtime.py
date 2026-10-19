@@ -155,6 +155,41 @@ class Runtime(unittest.TestCase):
         self.wait_for("skip id=caret-click ")
         self.assert_no_send("caret-click", seconds=0.65)
 
+    def test_redundant_focus_notifications_do_not_cancel_unchanged_input(self):
+        self.configure(delaySeconds=0.5)
+        self.start()
+        self.complete("redundant-focus")
+        self.wait_status(lambda status: status["pending"])
+        self.event("focus_notification", input="input-1")
+        self.event("focus_notification", window="window-1")
+        self.wait_for("would enter id=redundant-focus ")
+        self.assertNotIn("skip id=redundant-focus ", self.text())
+
+    def test_notification_for_another_target_cancels_even_if_current_focus_has_returned(self):
+        self.configure(delaySeconds=0.5)
+        self.start()
+        for field, original in [("window", "window-1"), ("input", "input-1")]:
+            with self.subTest(field=field):
+                identifier = f"notified-{field}"
+                self.complete(identifier)
+                self.wait_status(lambda status: status["pending"])
+                # The callback carries the earlier changed target, although
+                # reading current focus already returns the original target.
+                self.event("focus_notification", **{field: "elsewhere"})
+                self.event("focus_notification", **{field: original})
+                self.wait_for(f"skip id={identifier} window/input focus changed")
+                self.assert_no_send(identifier, seconds=0.7)
+
+    def test_focus_notification_still_cancels_when_current_focus_cannot_be_read(self):
+        self.configure(delaySeconds=0.5)
+        self.start()
+        self.complete("unreadable-notification")
+        self.wait_status(lambda status: status["pending"])
+        self.event("focus_notification", input="input-1", focusReadable=False)
+        self.wait_for("skip id=unreadable-notification cannot verify focus notification: cannot inspect caret/focus")
+        self.event("capability", focusReadable=True)
+        self.assert_no_send("unreadable-notification", seconds=0.7)
+
     def test_pause_cancels_pending_and_consumes_completed_rows(self):
         self.start()
         self.complete("pause-pending")

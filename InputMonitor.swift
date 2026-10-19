@@ -334,18 +334,15 @@ final class InputMonitor {
         }
         focusObserver = nil
         var observer: AXObserver?
-        guard AXObserverCreate(pid, { observer, _, _, context in
+        guard AXObserverCreate(pid, { observer, element, notification, context in
             if let context {
                 let monitor = Unmanaged<InputMonitor>.fromOpaque(context).takeUnretainedValue()
                 guard let activeObserver = monitor.focusObserver, CFEqual(observer, activeObserver) else { return }
                 guard monitor.attemptActive, let original = monitor.armedFocus else { return }
-                if case .success(let current) = monitor.currentFocus(), !original.sameTarget(as: current) {
-                    monitor.onFocusChange?("window/input focus changed")
-                } else {
-                    // AX notifications do not carry a reliable old/new focus pair. A same-target
-                    // snapshot may already be a switch back, so fail closed rather than miss it.
-                    monitor.onFocusChange?("focus change notification could not be resolved reliably")
-                }
+                var notified = original
+                if notification as String == kAXFocusedUIElementChangedNotification { notified.input = element }
+                else { notified.window = element }
+                monitor.handleFocusNotification(notified)
             }
         }, &observer) == .success, let observer else { return false }
         let app = AXUIElementCreateApplication(pid)
@@ -357,6 +354,23 @@ final class InputMonitor {
         focusObserver = observer
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         return true
+    }
+
+    private func handleFocusNotification(_ notified: FocusSnapshot) {
+        guard attemptActive, let original = armedFocus else { return }
+        // AX focus notifications identify the newly focused element. Check that
+        // payload as well as the current snapshot: a different payload still
+        // cancels if focus has already returned before this callback runs.
+        guard original.sameTarget(as: notified) else {
+            onFocusChange?("window/input focus changed")
+            return
+        }
+        switch currentFocus() {
+        case .success(let current):
+            if !original.sameTarget(as: current) { onFocusChange?("window/input focus changed") }
+        case .failure(let error):
+            onFocusChange?("cannot verify focus notification: \(error.reason)")
+        }
     }
 
     func poll() {
@@ -382,6 +396,12 @@ final class InputMonitor {
                 onKeyboard?("keyboard activity (including Fn/modifiers)")
             }
             let type = json["type"] as? String
+            if type == "focus_notification", var notified = armedFocus {
+                if let readable = json["focusReadable"] as? Bool { focusReadable = readable }
+                if let window = json["window"] as? String { notified.windowToken = window }
+                if let input = json["input"] as? String { notified.inputToken = input }
+                handleFocusNotification(notified)
+            }
             if type == "monitoring" {
                 if let value = json["enableSucceeds"] as? Bool { simulatedEnableSucceeds = value }
                 if let value = json["createSucceeds"] as? Bool { simulatedCreateSucceeds = value }
