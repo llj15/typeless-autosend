@@ -121,7 +121,7 @@ path.write_text(json.dumps(services))
         self.assertFalse((self.directory / "config.json").exists())
         self.assertFalse((self.home / "launchctl.log").exists())
 
-    def test_uninstall_stops_both_names_and_keeps_config_and_unrelated_links(self):
+    def test_uninstall_stops_both_names_and_removes_config_but_keeps_unrelated_links(self):
         self.legacy_install()
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -140,7 +140,7 @@ path.write_text(json.dumps(services))
         self.assertFalse((self.agents / f"{OLD}.plist").exists())
         self.assertFalse((self.bin / "typeless-autosend").is_symlink())
         self.assertEqual((self.bin / "typeless-autoenter").resolve(), unrelated)
-        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertFalse(self.config.exists())
 
     def test_missing_registered_binary_does_not_reset_config_in_other_checkout(self):
         self.legacy_install()

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Typeless AutoSend uninstaller: stop both service names and remove owned command links. Configuration is preserved.
+# Typeless AutoSend uninstaller: stop both service names and remove owned command links and configuration.
 set -euo pipefail
 UID_NUM="$(id -u)"
 DIR="$(cd "$(dirname "$0")" && pwd -P)"
@@ -20,7 +20,9 @@ for COMMAND in typeless-autosend typeless-autoenter; do
     rm "$COMMAND_LINK"
   fi
 done
+rm -f "$DIR/config.json"
 # Leave the PATH block: ~/.local/bin may also contain other user commands.
 echo "Stopped the service and removed its LaunchAgents"
-echo "The program directory and config.json were not deleted; remove the whole directory if you no longer need it."
+echo "Removed configuration: $DIR/config.json"
+echo "The program directory was not deleted; remove the whole directory if you no longer need it."
 echo "The Typeless AutoSend entry (and any older typeless-autoenter entry) in Accessibility and Input Monitoring must be removed by hand in System Settings."

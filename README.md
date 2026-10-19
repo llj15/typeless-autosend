@@ -112,4 +112,4 @@ For scripts, `TYPELESS_AUTOSEND_CONFIG` overrides the config path. The legacy `T
 ./uninstall.sh
 ```
 
-Uninstall stops both current and legacy service names, removes their LaunchAgents and removes their owned command links. It preserves the repository, configuration and shared PATH block. Remove the Accessibility entry manually if no longer needed.
+Uninstall stops both current and legacy service names, removes their LaunchAgents and owned command links, and deletes this installation's `config.json`. If the service cannot be stopped, uninstall aborts and keeps the configuration. The repository and shared PATH block remain. Remove the Accessibility entry manually if no longer needed.

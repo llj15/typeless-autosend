@@ -110,7 +110,7 @@ check("--app is ignored with a notice when config.json already exists",
 
 uninstalled = run("uninstall.sh", home, d)
 check("uninstall removes only its own global link", uninstalled.returncode == 0 and not os.path.lexists(link_path))
-check("uninstall preserves config and harmless shared PATH setup", os.path.exists(f"{d}/config.json") and os.path.exists(profile))
+check("uninstall removes config and preserves harmless shared PATH setup", not os.path.exists(f"{d}/config.json") and os.path.exists(profile))
 
 print("Reinstall after moving the installed directory")
 home, d = sandbox("old-location")
