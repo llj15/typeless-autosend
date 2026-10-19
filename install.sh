@@ -250,6 +250,8 @@ Next steps:
      If the executable is missing or an entry is stale after an upgrade,
      remove the stale entry with −, then add this same file with + in both lists:
      $DIR/typeless-autosend
+     After granting permissions, restart the service to refresh its permission state:
+     launchctl kickstart -k gui/$UID_NUM/$LABEL
   2. Find installed applications: typeless-autosend apps search <name>
      Enable one by Bundle ID: typeless-autosend apps add <bundle.id>
   3. Configure the delay: typeless-autosend delay set 1

@@ -94,7 +94,9 @@ check("permission guidance names both paths, the real binary and manual approval
       "System Settings → Privacy & Security → Input Monitoring" in r.stdout and
       f"{real}/typeless-autosend" in r.stdout and
       "Opening these pages does not grant permission" in r.stdout and
-      "last requested page (Input Monitoring)" in r.stdout)
+      "last requested page (Input Monitoring)" in r.stdout and
+      "After granting permissions, restart the service" in r.stdout and
+      f"launchctl kickstart -k gui/{UID}/{LABEL}" in r.stdout)
 link_path = f"{home}/.local/bin/typeless-autosend"
 check("installs globally callable link", os.path.islink(link_path) and os.path.realpath(link_path) == f"{real}/typeless-autosend")
 profile = f"{home}/.zshrc"
