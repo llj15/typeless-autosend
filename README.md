@@ -16,7 +16,7 @@ cd ~/Developer/typeless-autosend
 
 The installer builds the native executable, registers a login LaunchAgent, and links `~/.local/bin/typeless-autosend`. If necessary it adds a marked PATH block to your zsh or bash startup file. Open a new terminal after installing. Other shells receive a manual PATH instruction.
 
-Grant the executable Accessibility permission in System Settings → Privacy & Security → Accessibility. The service also needs permission to observe input events: check System Settings → Privacy & Security → Input Monitoring if its diagnostics report input monitoring unavailable. A rebuild can invalidate permissions: remove the old Accessibility entry and add the rebuilt executable again.
+The installer requests both permission pages: System Settings → Privacy & Security → Accessibility and System Settings → Privacy & Security → Input Monitoring. System Settings may show only the last requested page (Input Monitoring); use these paths to switch between them. Opening the pages does not grant permission: manually enable the executable printed by the installer in both lists. If a page cannot be opened, installation still finishes and prints the manual paths. A rebuild can invalidate permissions: remove stale entries and add the rebuilt executable again.
 
 Fresh installations enable **no apps**. Upgrades leave your existing configuration intact. The program, config and log remain in the repository directory. After moving it, run `./install.sh` again to update the service and command link.
 

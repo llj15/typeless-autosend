@@ -54,6 +54,9 @@ path.write_text(json.dumps(services))
 ''')
         compiler.chmod(0o755)
         launchctl.chmod(0o755)
+        opener = self.stubs / "open"
+        opener.write_text('#!/bin/bash\nprintf \'%s\\n\' "$@" >> "$HOME/open.log"\nexit 0\n')
+        opener.chmod(0o755)
         self.agents = self.home / "Library" / "LaunchAgents"
         self.agents.mkdir(parents=True)
         self.bin = self.home / ".local" / "bin"

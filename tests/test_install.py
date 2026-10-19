@@ -1,5 +1,5 @@
-"""install.sh and uninstall.sh in a sandbox: fake HOME, with stub swiftc and launchctl first on PATH.
-Nothing here touches the real service or the real LaunchAgents folder."""
+"""install.sh and uninstall.sh in a sandbox: fake HOME, with stub swiftc, launchctl and open first on PATH.
+Nothing here touches the real service, LaunchAgents folder or System Settings."""
 import json
 import glob
 import os
@@ -36,7 +36,11 @@ case "$1" in
 esac
 exit 0
 """)
-for stub in ("swiftc", "launchctl"):
+open(f"{STUBS}/open", "w").write("""#!/bin/bash
+printf '%s\\n' "$@" >> "$HOME/open.log"
+exit "${SBX_OPEN_FAIL:-0}"
+""")
+for stub in ("swiftc", "launchctl", "open"):
     os.chmod(f"{STUBS}/{stub}", 0o755)
 
 
@@ -78,6 +82,18 @@ check("the old log is kept as autosend.log.1 and the new log starts fresh",
 check("the binary is in place and nothing is left in .build",
       os.access(f"{d}/typeless-autosend", os.X_OK) and not os.path.exists(f"{d}/.build/typeless-autosend"))
 check("output is English", "==> Building" in r.stdout and "Next steps:" in r.stdout and not CJK.search(r.stdout + r.stderr))
+check("installation requests both privacy settings pages in order",
+      os.path.exists(f"{home}/open.log") and open(f"{home}/open.log").read().splitlines() == [
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"])
+check("permission guidance names both paths, the real binary and manual approval",
+      "System Settings → Privacy & Security → Accessibility" in r.stdout and
+      "System Settings → Privacy & Security → Input Monitoring" in r.stdout and
+      f"{real}/typeless-autosend" in r.stdout and
+      "Opening these pages does not grant permission" in r.stdout and
+      "last requested page (Input Monitoring)" in r.stdout)
+check("permission guidance includes a service restart to refresh grants",
+      f"launchctl kickstart -k gui/{UID}/{LABEL}" in r.stdout)
 link_path = f"{home}/.local/bin/typeless-autosend"
 check("installs globally callable link", os.path.islink(link_path) and os.path.realpath(link_path) == f"{real}/typeless-autosend")
 profile = f"{home}/.zshrc"
@@ -106,6 +122,13 @@ check("reinstall repairs owned stale command and service path", relocated.return
       relocated.stderr[-200:])
 
 print("Failure paths")
+home, d = sandbox("settings-unavailable")
+r = run("install.sh", home, d, SBX_OPEN_FAIL="1")
+check("failure to open Settings does not break installation or skip the second page",
+      r.returncode == 0 and os.path.exists(f"{home}/Library/LaunchAgents/{LABEL}.plist") and
+      os.path.islink(f"{home}/.local/bin/typeless-autosend") and
+      os.path.exists(f"{home}/open.log") and len(open(f"{home}/open.log").read().splitlines()) == 2 and
+      "Could not open" in r.stderr, r.stderr[-200:])
 home, d = sandbox("ta")
 r = run("install.sh", home, d, SBX_FAIL="1")
 check("bootstrap failure: exit 1, the reason and the Login Items hint",

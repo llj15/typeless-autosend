@@ -230,14 +230,28 @@ esac
 echo "==> Self-check"
 ./typeless-autosend doctor || true
 
+echo "==> Opening privacy settings"
+if ! open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' 2>/dev/null; then
+  echo "Could not open Accessibility settings. Use the manual path below." >&2
+fi
+if ! open 'x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent' 2>/dev/null; then
+  echo "Could not open Input Monitoring settings. Use the manual path below." >&2
+fi
+
 cat <<EOF
 
+System Settings may show only the last requested page (Input Monitoring).
+Opening these pages does not grant permission; enable both permissions manually.
+
 Next steps:
-  1. Grant Accessibility permission: System Settings → Privacy & Security → Accessibility,
-     then switch on typeless-autosend.
-     If no prompt appeared, or an old entry is already listed (entries go stale after an upgrade):
-     remove it with −, then add this file with +
+  1. Enable typeless-autosend in both permission lists:
+     System Settings → Privacy & Security → Accessibility
+     System Settings → Privacy & Security → Input Monitoring
+     If the executable is missing or an entry is stale after an upgrade,
+     remove the stale entry with −, then add this same file with + in both lists:
      $DIR/typeless-autosend
+     After granting permissions, refresh the service:
+     launchctl kickstart -k gui/$UID_NUM/$LABEL
   2. Find installed applications: typeless-autosend apps search <name>
      Enable one by Bundle ID: typeless-autosend apps add <bundle.id>
   3. Configure the delay: typeless-autosend delay set 1
