@@ -55,6 +55,22 @@ class Runtime(unittest.TestCase):
                                         stderr=subprocess.STDOUT)
         self.wait_for("baseline ready")
 
+    def service_status(self):
+        result = subprocess.run([self.binary, "service", "status"],
+            env=dict(os.environ, TYPELESS_AUTOSEND_CONFIG=str(self.config)),
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def wait_status(self, predicate, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = self.service_status()
+            if predicate(status):
+                return status
+            time.sleep(0.04)
+        self.fail(f"status did not satisfy expectation: {status}")
+
     def complete(self, identifier):
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         self.db.execute("insert into history_v2(id,status,mode,refined_text,created_at,updated_at,app_version,synced_from_cloud) values(?, 'completed','voice_transcript','hello',?,?, 'x',0)",
@@ -150,6 +166,158 @@ class Runtime(unittest.TestCase):
         self.configure(paused=False)
         self.assert_no_send("while-paused", seconds=1.3)
 
+    def test_tap_timeout_cancels_old_countdown_and_recovers_for_new_transcript(self):
+        self.configure(delaySeconds=0.6)
+        self.start()
+        self.complete("tap-interrupted")
+        time.sleep(0.2)
+        self.event("monitoring", tap="timeout")
+        self.wait_for("skip id=tap-interrupted input monitoring interrupted")
+        self.assert_no_send("tap-interrupted", seconds=0.8)
+        self.complete("after-tap-recovery")
+        self.wait_for("would enter id=after-tap-recovery ")
+        self.assertEqual(self.process.poll(), None)
+
+    def test_listener_recovers_from_disabled_invalid_missing_tap_and_missing_source(self):
+        self.configure(delaySeconds=0.35)
+        self.start()
+        for fault in ("user_disabled", "invalid", "missing", "source_missing"):
+            with self.subTest(fault=fault):
+                self.complete(fault)
+                time.sleep(0.2)
+                self.event("monitoring", tap=fault)
+                self.wait_for(f"skip id={fault} ")
+                self.assert_no_send(fault, seconds=0.5)
+                self.complete(f"recovered-{fault}")
+                self.wait_for(f"would enter id=recovered-{fault} ")
+
+    def test_failed_recovery_stays_unavailable_and_retries_at_most_once_per_second(self):
+        self.configure(delaySeconds=0.2)
+        self.event("monitoring", tap="timeout", enableSucceeds=False, createSucceeds=False)
+        self.start()
+        failed = self.wait_status(lambda status: status.get("inputMonitoringRecoveryAttempts") == 1)
+        self.assertFalse(failed["inputMonitoringAvailable"])
+        self.assertEqual(failed["inputMonitoringReason"], "tap_missing")
+        self.assertFalse(failed["inputTapPresent"])
+        self.assertFalse(failed["inputTapSourcePresent"])
+        time.sleep(0.3)
+        self.assertEqual(self.service_status()["inputMonitoringRecoveryAttempts"], 1)
+        self.complete("during-recovery-failure")
+        self.wait_for("skip id=during-recovery-failure ")
+        self.event("monitoring", createSucceeds=True)
+        recovered = self.wait_status(lambda status: status["inputMonitoringAvailable"])
+        self.assertIsNone(recovered["inputMonitoringReason"])
+        self.assertTrue(recovered["inputTapValid"])
+        self.assertTrue(recovered["inputTapSourcePresent"])
+        self.assertTrue(recovered["inputTapEnabled"])
+        self.assertGreaterEqual(recovered["inputMonitoringRecoveryAttempts"], 2)
+        self.complete("after-recovery-retry")
+        self.wait_for("would enter id=after-recovery-retry ")
+        self.assert_no_send("during-recovery-failure")
+
+    def test_failed_reenable_falls_back_to_recreate_and_still_cancels_old_attempt(self):
+        self.configure(delaySeconds=0.5)
+        self.start()
+        self.complete("failed-enable-pending")
+        self.wait_status(lambda status: status["pending"])
+        self.event("monitoring", tap="timeout", enableSucceeds=False, createSucceeds=True)
+        self.wait_for("skip id=failed-enable-pending ")
+        restored = self.wait_status(lambda status: status.get("inputMonitoringRecoveryAttempts") == 1)
+        self.assertTrue(restored["inputMonitoringAvailable"])
+        self.assertTrue(restored["inputTapValid"])
+        self.assertTrue(restored["inputTapSourcePresent"])
+        self.complete("fresh-after-recreate")
+        self.wait_for("would enter id=fresh-after-recreate ")
+        self.assert_no_send("failed-enable-pending")
+
+    def test_completion_unread_during_outage_is_not_replayed_when_monitor_recovers(self):
+        self.configure(delaySeconds=0.2)
+        self.start()
+        self.process.send_signal(signal.SIGSTOP)
+        try:
+            self.event("monitoring", tap="timeout")
+            self.complete("completed-inside-outage")
+        finally:
+            self.process.send_signal(signal.SIGCONT)
+        self.wait_for("skip id=completed-inside-outage ")
+        self.assert_no_send("completed-inside-outage", seconds=0.7)
+        self.wait_status(lambda status: status["inputMonitoringAvailable"])
+        self.complete("truly-new-after-recovery")
+        self.wait_for("would enter id=truly-new-after-recovery ")
+
+    def test_recovery_inside_attempt_after_database_wait_does_not_bypass_recovery_cutoff(self):
+        self.configure(delaySeconds=0.2)
+        self.event("monitoring", tap="invalid", createSucceeds=False)
+        self.start()
+        failed = self.wait_status(lambda status: status.get("inputMonitoringRecoveryAttempts") == 1)
+        first_tick = dt.datetime.fromisoformat(failed["updatedAt"].replace("Z", "+00:00")).timestamp()
+        self.process.send_signal(signal.SIGSTOP)
+        try:
+            self.event("monitoring", createSucceeds=True)
+            self.complete("unread-before-attempt-recovery")
+            self.db.execute("BEGIN EXCLUSIVE")
+            remaining = first_tick + 0.9 - time.time()
+            if remaining > 0:
+                time.sleep(remaining)
+        finally:
+            self.process.send_signal(signal.SIGCONT)
+        # The SQLite boundary holds the poll just below the one-second retry
+        # deadline, then lets beginAttempt run just after it.
+        time.sleep(0.18)
+        self.db.commit()
+        self.wait_for("skip id=unread-before-attempt-recovery ")
+        self.assert_no_send("unread-before-attempt-recovery", seconds=0.6)
+        self.wait_status(lambda status: status["inputMonitoringAvailable"])
+        self.complete("new-after-attempt-recovery")
+        self.wait_for("would enter id=new-after-attempt-recovery ")
+
+    def test_permission_and_secure_input_fail_closed_without_recovery_storm_or_replay(self):
+        self.configure(delaySeconds=0.5)
+        self.start()
+        for field, unavailable, restored, reason in (("inputMonitoring", False, True, "listen_permission_denied"),
+                                                      ("secureInput", True, False, "secure_input")):
+            with self.subTest(reason=reason):
+                self.complete(f"pending-{reason}")
+                self.wait_status(lambda status: status["pending"])
+                before = self.service_status()["inputMonitoringRecoveryAttempts"]
+                self.event("capability", **{field: unavailable})
+                self.event("monitoring", tap="invalid", createSucceeds=False)
+                failed = self.wait_status(lambda status: status.get("inputMonitoringReason") == reason)
+                self.assertFalse(failed["inputMonitoringAvailable"])
+                self.assertEqual(failed["inputMonitoringRecoveryAttempts"], before)
+                self.complete(f"during-{reason}")
+                self.wait_for(f"skip id=during-{reason} ")
+                time.sleep(1.1)
+                self.assertEqual(self.service_status()["inputMonitoringRecoveryAttempts"], before)
+                self.event("monitoring", createSucceeds=True)
+                self.event("capability", **{field: restored})
+                self.wait_status(lambda status: status["inputMonitoringAvailable"])
+                self.complete(f"new-{reason}")
+                self.wait_for(f"would enter id=new-{reason} ")
+                self.assert_no_send(f"pending-{reason}")
+                self.assert_no_send(f"during-{reason}")
+
+    def test_brief_capability_loss_and_restore_in_one_poll_never_sends_old_completion(self):
+        self.configure(delaySeconds=0.6)
+        self.start()
+        for field, unavailable, restored in (("inputMonitoring", False, True), ("secureInput", True, False)):
+            with self.subTest(field=field):
+                self.complete(f"pending-brief-{field}")
+                self.wait_status(lambda status: status["pending"])
+                self.process.send_signal(signal.SIGSTOP)
+                try:
+                    self.event("capability", **{field: unavailable})
+                    self.complete(f"unread-brief-{field}")
+                    self.event("capability", **{field: restored})
+                finally:
+                    self.process.send_signal(signal.SIGCONT)
+                self.wait_for(f"skip id=unread-brief-{field} ")
+                self.assert_no_send(f"pending-brief-{field}", seconds=0.75)
+                self.assert_no_send(f"unread-brief-{field}")
+                self.wait_status(lambda status: status["inputMonitoringAvailable"])
+                self.complete(f"new-brief-{field}")
+                self.wait_for(f"would enter id=new-brief-{field} ")
+
     def test_missing_system_capability_skips_this_attempt_and_retries_next_transcript(self):
         self.configure(delaySeconds=0.2)
         self.event("capability", inputMonitoring=False)
@@ -157,6 +325,7 @@ class Runtime(unittest.TestCase):
         self.complete("cannot-listen")
         self.wait_for("skip id=cannot-listen ")
         self.event("capability", inputMonitoring=True, focusReadable=False)
+        self.wait_status(lambda status: status["inputMonitoringAvailable"])
         self.complete("cannot-inspect")
         self.wait_for("skip id=cannot-inspect ")
         self.event("capability", focusReadable=True)
@@ -183,6 +352,7 @@ class Runtime(unittest.TestCase):
         self.complete("secure-input")
         self.wait_for("skip id=secure-input ")
         self.event("capability", secureInput=False)
+        self.wait_status(lambda status: status["inputMonitoringAvailable"])
         self.complete("secure-ended")
         self.wait_for("would enter id=secure-ended ")
         self.assert_no_send("secure-input")

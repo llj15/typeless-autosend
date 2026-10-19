@@ -288,6 +288,23 @@ func runDoctor() -> Int32 {
         warn("No Accessibility record from the service in the log yet (has it ever started?)")
     }
 
+    if let runtime = currentRuntimeStatus(store: SettingsStore(path: configPath)) {
+        if runtime["inputMonitoringAvailable"] as? Bool == true {
+            ok("Background service Input Monitoring is available")
+        } else {
+            let reason = runtime["inputMonitoringReason"] as? String ?? "unavailable"
+            let suggestion: String
+            switch reason {
+            case "secure_input": suggestion = "Finish secure input (for example, leave the password field), then retry."
+            case "listen_permission_denied": suggestion = "Check System Settings → Privacy & Security → Input Monitoring; after granting permission, restart the service with: launchctl kickstart -k gui/\(getuid())/\(serviceLabel)"
+            default: suggestion = "The service retries listener recovery once per second. If it remains unavailable, restart it with: launchctl kickstart -k gui/\(getuid())/\(serviceLabel)"
+            }
+            fail("Background service Input Monitoring is unavailable (\(reason)). \(suggestion)")
+        }
+    } else {
+        fail("No current Input Monitoring status from the service. Run typeless-autosend service status; restart with: launchctl kickstart -k gui/\(getuid())/\(serviceLabel)")
+    }
+
     if let result = launchctlOutput(["print", "gui/\(getuid())/\(serviceLabel)"]),
        result.status == 0, result.output.contains("state = running") {
         ok("Background service is running")
@@ -370,6 +387,7 @@ let runtimeStatusPath = URL(fileURLWithPath: configPath).deletingLastPathCompone
 func writeRuntimeStatus() {
     var status: [String: Any] = ["pid": getpid(), "updatedAt": isoFrac.string(from: Date()),
         "pending": enterPending, "inputMonitoringAvailable": inputMonitor.available]
+    status.merge(inputMonitor.monitoringDetails) { _, new in new }
     status["lastSkipReason"] = lastSkipReason ?? NSNull()
     if let data = try? JSONSerialization.data(withJSONObject: status, options: [.sortedKeys]) {
         try? data.write(to: runtimeStatusPath, options: .atomic)
@@ -394,6 +412,7 @@ func cancelPending(_ reason: String) {
 }
 inputMonitor.onKeyboard = cancelPending
 inputMonitor.onFocusChange = cancelPending
+inputMonitor.onMonitoringChange = { log($0) }
 
 func process(_ rows: [Row]) {
     guard var known = seen else {
@@ -418,6 +437,12 @@ func process(_ rows: [Row]) {
            let completedAt = row.updatedAt, completedAt.timeIntervalSince1970 <= settings.resumeAfter {
             known.insert(row.id)
             recordSkip(row.id, "completed at or before latest resume")
+            continue
+        }
+        if let recoveredAfter = inputMonitor.recoveredAfter, let completedAt = row.updatedAt,
+           completedAt <= recoveredAfter {
+            known.insert(row.id)
+            recordSkip(row.id, "completed at or before input monitoring recovery")
             continue
         }
         // A record whose status turned completed before its text was written: while it is fresh, do not
@@ -447,6 +472,13 @@ func process(_ rows: [Row]) {
         switch inputMonitor.beginAttempt() {
         case .failure(let error): recordSkip(row.id, error.reason); continue
         case .success(let snapshot): focus = snapshot
+        }
+        // beginAttempt can recover a listener after a slow database read has
+        // crossed the retry deadline, so use the latest recovery boundary too.
+        if let recoveredAfter = inputMonitor.recoveredAfter, let completedAt = row.updatedAt,
+           completedAt <= recoveredAfter {
+            recordSkip(row.id, "completed at or before input monitoring recovery")
+            continue
         }
         let front = focus.bundleID
         let isTarget = Set(settings.apps.map(normalizeBundleID)).contains(normalizeBundleID(front))
@@ -503,6 +535,12 @@ func process(_ rows: [Row]) {
             }
             guard (latest.appCancellationRevisions[normalizeBundleID(front)] ?? 0) == appCancellationRevision else {
                 recordSkip(row.id, "app was removed during countdown")
+                return
+            }
+            // Focus/config reads can take time. Recheck health without repairing
+            // immediately before posting, so a new observed outage cannot be hidden.
+            guard inputMonitor.available else {
+                recordSkip(row.id, "input monitoring unavailable before send")
                 return
             }
             if dryRun {

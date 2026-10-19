@@ -69,6 +69,10 @@ typeless-autosend doctor
 
 Pause survives restarts and login; resume explicitly to enable sending again. Transcriptions completed before that resume are not replayed, even if the service was briefly stalled during the pause. Pausing or removing the pending app cancels its countdown. Changing a delay affects subsequent transcriptions only. Status includes the latest skip reason when runtime information is available.
 
+An observed input-listener interruption cancels the current countdown permanently. While permissions allow it and Secure Input is off, the service tries to re-enable or recreate the listener at most once per second. Recovery does not replay transcriptions completed at or before that recovery; only later completions can schedule a new countdown. Missing Input Monitoring permission and Secure Input keep sending disabled without repeatedly rebuilding the listener.
+
+`service status` includes the listener's reason, permission, Secure Input, event tap and run-loop-source states, recovery count and latest recovery time. `doctor` fails when listener status is unavailable, missing or stale instead of reporting “All good”. If permissions were granted but the listener remains unavailable, restart the existing service with `launchctl kickstart -k gui/$(id -u)/local.typeless-autosend`, then check status again. Logs record observed listener state changes; they do not identify unobserved OS permission changes as a proven cause.
+
 ## Configuration and scripting
 
 Commands update the sibling `config.json` atomically. Existing apps-only configurations are supported and unknown fields are preserved. The service reloads settings without a restart. Use the CLI for cancellation guarantees: pause and removal commands leave a durable cancellation revision even if immediately reversed. Direct hand-edits are sampled approximately every 100 ms, so intermediate edits that are reverted before the next sample cannot be guaranteed to cancel a countdown.

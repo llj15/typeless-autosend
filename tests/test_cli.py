@@ -287,6 +287,42 @@ exit(runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: Settings
         self.assertTrue(add["arguments"][0]["required"])
         self.assertIn("--if-not-exists", [flag["name"] for flag in add["flags"]])
 
+    def test_doctor_fails_when_service_reports_input_monitoring_unavailable(self):
+        self.config.write_text('{"apps":["com.apple.finder"]}')
+        status = Path(self.temp.name) / "runtime-status.json"
+        status.write_text(json.dumps({"pid": os.getpid(),
+            "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "inputMonitoringAvailable": False, "inputMonitoringReason": "listen_permission_denied"}))
+        result = self.command("doctor")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Input Monitoring", result.stdout)
+        self.assertIn("listen_permission_denied", result.stdout)
+        self.assertNotIn("All good", result.stdout)
+
+    def test_doctor_distinguishes_secure_input_from_missing_permission(self):
+        self.config.write_text('{"apps":["com.apple.finder"]}')
+        status = Path(self.temp.name) / "runtime-status.json"
+        status.write_text(json.dumps({"pid": os.getpid(),
+            "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "inputMonitoringAvailable": False, "inputMonitoringReason": "secure_input"}))
+        result = self.command("doctor")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Finish secure input", result.stdout)
+        self.assertNotIn("after granting permission", result.stdout)
+
+    def test_doctor_does_not_report_success_without_fresh_listener_status(self):
+        self.config.write_text('{"apps":["com.apple.finder"]}')
+        status = Path(self.temp.name) / "runtime-status.json"
+        for value in (None, "2000-01-01T00:00:00Z"):
+            with self.subTest(updatedAt=value):
+                if value is not None:
+                    status.write_text(json.dumps({"pid": os.getpid(), "updatedAt": value,
+                                                  "inputMonitoringAvailable": True}))
+                result = self.command("doctor")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("No current Input Monitoring status", result.stdout)
+                self.assertNotIn("All good", result.stdout)
+
     def test_service_status_reads_current_runtime_skip_reason_and_ignores_stale_status(self):
         status = Path(self.temp.name) / "runtime-status.json"
         data = {"pid": os.getpid(), "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),

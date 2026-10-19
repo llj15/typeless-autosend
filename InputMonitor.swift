@@ -28,6 +28,25 @@ struct FocusSnapshot {
 
 struct InputMonitorError: Error { let reason: String }
 
+private struct InputMonitoringState: Equatable {
+    var permissionGranted = true
+    var secureInputEnabled = false
+    var tapPresent = true
+    var tapValid = true
+    var sourcePresent = true
+    var tapEnabled = true
+
+    var unavailableReason: String? {
+        if !permissionGranted { return "listen_permission_denied" }
+        if secureInputEnabled { return "secure_input" }
+        if !tapPresent { return "tap_missing" }
+        if !tapValid { return "tap_invalid" }
+        if !sourcePresent { return "tap_source_missing" }
+        if !tapEnabled { return "tap_disabled" }
+        return nil
+    }
+}
+
 private func validSelectionRange(location: Int, length: Int) -> Bool {
     location >= 0 && length >= 0 && location != NSNotFound && length != NSNotFound
 }
@@ -43,26 +62,54 @@ final class InputMonitor {
     private var focusObserver: AXObserver?
     private var simulatedFocus: FocusSnapshot
     private var focusReadable = true
-    private var simulatedSecureInput = false
+    private var simulatedMonitoring = InputMonitoringState()
+    private var simulatedEnableSucceeds = true
+    private var simulatedCreateSucceeds = true
     private var attemptEpoch = 0
     private var attemptActive = false
     private var armedFocus: FocusSnapshot?
     private var mouseSelectionBaseline: FocusSnapshot?
     private(set) var mouseChecksPending = 0
-    private var monitoringAvailable = false
-    var available: Bool {
-        if dryRun { return monitoringAvailable && !simulatedSecureInput }
-        guard monitoringAvailable, !IsSecureEventInputEnabled(), CGPreflightListenEventAccess(), let tap else { return false }
-        return CGEvent.tapIsEnabled(tap: tap)
+    private var nextRecoveryAt: TimeInterval = 0
+    private var lastReportedMonitoringState: InputMonitoringState?
+    private var observedMonitoringGap = false
+    private(set) var recoveredAfter: Date?
+    private(set) var recoveryAttempts = 0
+    private var monitoringState: InputMonitoringState {
+        let state: InputMonitoringState
+        if dryRun { state = simulatedMonitoring }
+        else {
+            state = InputMonitoringState(permissionGranted: CGPreflightListenEventAccess(),
+                secureInputEnabled: IsSecureEventInputEnabled(), tapPresent: tap != nil,
+                tapValid: tap.map { CFMachPortIsValid($0) } ?? false,
+                sourcePresent: tapSource.map { CFRunLoopSourceIsValid($0) && CFRunLoopContainsSource(CFRunLoopGetMain(), $0, .commonModes) } ?? false,
+                tapEnabled: tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false)
+        }
+        // Even a health-only check before sending must remember an observed
+        // gap if the OS recovers before the next recovery poll.
+        if state.unavailableReason != nil { observedMonitoringGap = true }
+        return state
+    }
+    var available: Bool { monitoringState.unavailableReason == nil }
+    var monitoringDetails: [String: Any] {
+        let state = monitoringState
+        return ["inputMonitoringAvailable": state.unavailableReason == nil,
+            "inputMonitoringReason": state.unavailableReason as Any? ?? NSNull(),
+            "inputMonitoringPermissionGranted": state.permissionGranted,
+            "secureInputEnabled": state.secureInputEnabled, "inputTapPresent": state.tapPresent,
+            "inputTapValid": state.tapValid, "inputTapSourcePresent": state.sourcePresent,
+            "inputTapEnabled": state.tapEnabled, "inputMonitoringRecoveryAttempts": recoveryAttempts,
+            "inputMonitoringRecoveredAt": recoveredAfter.map { ISO8601DateFormatter.string(from: $0, timeZone: .current, formatOptions: [.withInternetDateTime, .withFractionalSeconds]) } as Any? ?? NSNull()]
     }
     var onKeyboard: ((String) -> Void)?
     var onFocusChange: ((String) -> Void)?
+    var onMonitoringChange: ((String) -> Void)?
 
     init(dryRun: Bool, environment: [String: String]) {
         self.dryRun = dryRun
         eventPath = dryRun ? environment["TYPELESS_TEST_EVENTS"] : nil
         simulatedFocus = FocusSnapshot(bundleID: environment["TYPELESS_FAKE_FRONT"] ?? "dry-run")
-        if dryRun { monitoringAvailable = true } else {
+        if !dryRun {
             installTap()
             activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
@@ -72,6 +119,14 @@ final class InputMonitor {
     }
 
     private func installTap() {
+        if dryRun {
+            guard simulatedCreateSucceeds else { return }
+            simulatedMonitoring.tapPresent = true
+            simulatedMonitoring.tapValid = true
+            simulatedMonitoring.sourcePresent = true
+            simulatedMonitoring.tapEnabled = true
+            return
+        }
         guard CGPreflightListenEventAccess() else { return }
         let mask = [CGEventType.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp,
                     .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp].reduce(CGEventMask(0)) {
@@ -89,13 +144,67 @@ final class InputMonitor {
         tapSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        monitoringAvailable = CGEvent.tapIsEnabled(tap: tap)
+    }
+
+    private func removeTap() {
+        if dryRun {
+            simulatedMonitoring.tapPresent = false
+            simulatedMonitoring.tapValid = false
+            simulatedMonitoring.sourcePresent = false
+            simulatedMonitoring.tapEnabled = false
+            return
+        }
+        if let tapSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), tapSource, .commonModes)
+            CFRunLoopSourceInvalidate(tapSource)
+        }
+        if let tap { CFMachPortInvalidate(tap) }
+        tap = nil
+        tapSource = nil
+    }
+
+    private func recoverMonitoringIfNeeded() {
+        let state = monitoringState
+        if observedMonitoringGap {
+            onKeyboard?("input monitoring unavailable: \(state.unavailableReason ?? "interruption observed")")
+        }
+        reportMonitoringState()
+        defer {
+            if available && observedMonitoringGap {
+                recoveredAfter = Date()
+                observedMonitoringGap = false
+            }
+            reportMonitoringState()
+        }
+        guard state.unavailableReason != nil else { return }
+        // Every observed gap cancels the old attempt before any operation can
+        // make the listener appear healthy again. Recovery never resumes it.
+        guard state.permissionGranted, !state.secureInputEnabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= nextRecoveryAt else { return }
+        nextRecoveryAt = now + 1
+        recoveryAttempts += 1
+        if state.tapPresent && state.tapValid && state.sourcePresent {
+            if dryRun { simulatedMonitoring.tapEnabled = simulatedEnableSucceeds }
+            else if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+        }
+        if !available {
+            removeTap()
+            installTap()
+        }
+    }
+
+    private func reportMonitoringState() {
+        let state = monitoringState
+        guard state != lastReportedMonitoringState else { return }
+        lastReportedMonitoringState = state
+        onMonitoringChange?("input monitoring available=\(state.unavailableReason == nil) reason=\(state.unavailableReason ?? "ready") listenPermission=\(state.permissionGranted) secureInput=\(state.secureInputEnabled) tapPresent=\(state.tapPresent) tapValid=\(state.tapValid) sourcePresent=\(state.sourcePresent) tapEnabled=\(state.tapEnabled)")
     }
 
     private func handle(_ type: CGEventType, _ event: CGEvent) {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            monitoringAvailable = false
-            onKeyboard?("input monitoring interrupted")
+            let reason = type == .tapDisabledByTimeout ? "tap_timeout" : "tap_user_disabled"
+            monitoringInterrupted(reason)
             return
         }
         if [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp].contains(type) {
@@ -122,6 +231,12 @@ final class InputMonitor {
         let sourcePID = pid_t(event.getIntegerValueField(.eventSourceUnixProcessID))
         if isVerifiedTypelessSource(sourcePID) { return }
         onKeyboard?("keyboard activity (including Fn/modifiers)")
+    }
+
+    private func monitoringInterrupted(_ reason: String) {
+        observedMonitoringGap = true
+        onMonitoringChange?("input monitoring interrupted reason=\(reason)")
+        onKeyboard?("input monitoring interrupted: \(reason)")
     }
 
     private func isVerifiedTypelessSource(_ pid: pid_t) -> Bool {
@@ -166,14 +281,8 @@ final class InputMonitor {
     }
 
     func beginAttempt() -> Result<FocusSnapshot, InputMonitorError> {
-        if !dryRun, !available {
-            if let tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), tapSource, .commonModes) }
-            if let tap { CFMachPortInvalidate(tap) }
-            tap = nil
-            tapSource = nil
-            installTap()
-        }
-        guard available else { return .failure(InputMonitorError(reason: "input monitoring unavailable")) }
+        recoverMonitoringIfNeeded()
+        guard available else { return .failure(InputMonitorError(reason: "input monitoring unavailable: \(monitoringState.unavailableReason ?? "unknown")")) }
         let result = currentFocus()
         if !dryRun, case .success(let snapshot) = result, !observeFocus(pid: snapshot.processID) {
             return .failure(InputMonitorError(reason: "focus notifications unavailable"))
@@ -251,9 +360,10 @@ final class InputMonitor {
     }
 
     func poll() {
+        defer { recoverMonitoringIfNeeded() }
         guard dryRun, let eventPath else { return }
         guard let data = FileManager.default.contents(atPath: eventPath), data.count >= eventOffset else {
-            monitoringAvailable = false
+            simulatedMonitoring.permissionGranted = false
             onKeyboard?("simulated input stream unavailable")
             return
         }
@@ -263,7 +373,7 @@ final class InputMonitor {
         eventOffset += complete.count
         for line in complete.split(separator: 10) {
             guard let json = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
-                monitoringAvailable = false
+                simulatedMonitoring.permissionGranted = false
                 onKeyboard?("simulated input event invalid")
                 continue
             }
@@ -272,11 +382,27 @@ final class InputMonitor {
                 onKeyboard?("keyboard activity (including Fn/modifiers)")
             }
             let type = json["type"] as? String
+            if type == "monitoring" {
+                if let value = json["enableSucceeds"] as? Bool { simulatedEnableSucceeds = value }
+                if let value = json["createSucceeds"] as? Bool { simulatedCreateSucceeds = value }
+                switch json["tap"] as? String {
+                case "timeout", "user_disabled":
+                    simulatedMonitoring.tapEnabled = false
+                    monitoringInterrupted(json["tap"] as? String == "timeout" ? "tap_timeout" : "tap_user_disabled")
+                case "invalid": simulatedMonitoring.tapValid = false
+                case "missing": simulatedMonitoring.tapPresent = false
+                case "source_missing": simulatedMonitoring.sourcePresent = false
+                default: break
+                }
+            }
             if type == "capability" {
-                if let value = json["inputMonitoring"] as? Bool { monitoringAvailable = value }
+                if let value = json["inputMonitoring"] as? Bool { simulatedMonitoring.permissionGranted = value }
                 if let value = json["focusReadable"] as? Bool { focusReadable = value }
-                if let value = json["secureInput"] as? Bool { simulatedSecureInput = value }
-                if !available { onKeyboard?("input monitoring unavailable") }
+                if let value = json["secureInput"] as? Bool { simulatedMonitoring.secureInputEnabled = value }
+                if !available {
+                    observedMonitoringGap = true
+                    onKeyboard?("input monitoring unavailable")
+                }
                 if !focusReadable { onFocusChange?("cannot inspect caret/focus") }
             }
             if type == "focus" || type == "state" || type == "mouse" {

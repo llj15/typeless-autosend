@@ -99,10 +99,15 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
                 }
             }
             let runtime = currentRuntimeStatus(store: store)
-            emit(["running": serviceRunning() || runtime != nil, "paused": settings.paused, "delaySeconds": settings.delaySeconds,
+            var result: [String: Any] = ["running": serviceRunning() || runtime != nil, "paused": settings.paused, "delaySeconds": settings.delaySeconds,
                   "apps": settings.apps, "configPath": store.path, "lastSkipReason": runtime?["lastSkipReason"] ?? NSNull(),
                   "pending": runtime?["pending"] ?? false, "inputMonitoringAvailable": runtime?["inputMonitoringAvailable"] ?? NSNull(),
-                  "pid": runtime?["pid"] ?? NSNull(), "updatedAt": runtime?["updatedAt"] ?? NSNull(), "dryRun": dryRun])
+                  "pid": runtime?["pid"] ?? NSNull(), "updatedAt": runtime?["updatedAt"] ?? NSNull(), "dryRun": dryRun]
+            for key in ["inputMonitoringReason", "inputMonitoringPermissionGranted", "secureInputEnabled",
+                        "inputTapPresent", "inputTapValid", "inputTapSourcePresent", "inputTapEnabled", "inputMonitoringRecoveryAttempts", "inputMonitoringRecoveredAt"] {
+                result[key] = runtime?[key] ?? NSNull()
+            }
+            emit(result)
             return dryRun ? 10 : 0
         }
         if arguments == ["delay", "get"] {
@@ -185,7 +190,7 @@ private func nextCancellationRevision(_ current: UInt64) throws -> UInt64 {
     return next
 }
 
-private func currentRuntimeStatus(store: SettingsStore) -> [String: Any]? {
+func currentRuntimeStatus(store: SettingsStore) -> [String: Any]? {
     let url = URL(fileURLWithPath: store.path).deletingLastPathComponent().appendingPathComponent("runtime-status.json")
     guard let data = try? Data(contentsOf: url),
           let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
