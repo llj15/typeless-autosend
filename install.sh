@@ -1,10 +1,12 @@
 #!/bin/bash
-# typeless-autosend installer: build in place, generate the LaunchAgent, start the service. Safe to re-run; upgrades use it too.
+# typeless-autosend installer: build from source or install a release binary, register and start the service. Safe to re-run.
 # Usage: ./install.sh [--app <bundle id>]...
 #   On first install, writes these apps to the config.json whitelist; an existing config.json is left untouched.
 set -euo pipefail
-cd "$(dirname "$0")"
-DIR="$(pwd -P)"
+SOURCE_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+DIR="${TYPELESS_INSTALL_DIR:-$SOURCE_DIR}"
+PREBUILT_BINARY="${TYPELESS_INSTALL_BINARY:-}"
+if [ -d "$DIR" ]; then DIR="$(cd "$DIR" && pwd -P)"; fi
 LABEL="local.typeless-autosend"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 UID_NUM="$(id -u)"
@@ -43,11 +45,15 @@ for registered_plist in "$LEGACY_PLIST" "$PLIST"; do
 done
 
 [ "$(uname)" = Darwin ] || { echo "macOS only" >&2; exit 1; }
-swiftc --version >/dev/null 2>&1 || {
-  echo "swiftc is not available: run xcode-select --install to install the Command Line Tools." >&2
-  echo "If they are already installed, try sudo xcodebuild -license accept, or update the Command Line Tools, then re-run this script." >&2
-  exit 1
-}
+if [ -z "$PREBUILT_BINARY" ]; then
+  swiftc --version >/dev/null 2>&1 || {
+    echo "swiftc is not available: run xcode-select --install to install the Command Line Tools." >&2
+    echo "If they are already installed, try sudo xcodebuild -license accept, or update the Command Line Tools, then re-run this script." >&2
+    exit 1
+  }
+else
+  [ -x "$PREBUILT_BINARY" ] || { echo "Release binary is missing or not executable: $PREBUILT_BINARY" >&2; exit 1; }
+fi
 case "$DIR" in
   *[\&\<\>\"]*) echo "The directory path contains one of & < > \" -- install from a different directory" >&2; exit 1 ;;
 esac
@@ -84,11 +90,33 @@ if [ -e "$COMMAND_LINK" ] || [ -L "$COMMAND_LINK" ]; then
   fi
 fi
 
-echo "==> Building"
+mkdir -p "$DIR"
+cd "$DIR"
 # Build into a temp directory first, then replace: no half-written binary is left behind,
 # and the code-signing identifier stays typeless-autosend.
 mkdir -p .build
-swiftc -O ./*.swift -o .build/typeless-autosend -lsqlite3
+if [ -n "$PREBUILT_BINARY" ]; then
+  echo "==> Installing precompiled binary"
+  cp "$PREBUILT_BINARY" .build/typeless-autosend
+else
+  echo "==> Building"
+  swiftc -O "$SOURCE_DIR"/*.swift -o .build/typeless-autosend -lsqlite3
+fi
+
+# Stage first, then stop and verify both service names before replacing the binary.
+# bootout can return before launchd has finished removing the job.
+stop_service() {
+  local label="$1"
+  launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then return; fi
+    sleep 0.2
+  done
+  echo "Service $label could not be stopped; upgrade cancelled. Run: launchctl bootout gui/$UID_NUM/$label" >&2
+  exit 1
+}
+stop_service "$LEGACY_LABEL"
+stop_service "$LABEL"
 mv .build/typeless-autosend typeless-autosend
 
 if [ ! -f config.json ]; then
@@ -106,24 +134,12 @@ if [ ! -f config.json ]; then
       echo '}'
     } > config.json
   else
-    cp config.example.json config.json
+    cp "$SOURCE_DIR/config.example.json" config.json
   fi
 elif [ ${#apps[@]} -gt 0 ]; then
   echo "Note: config.json already exists and was left untouched; --app was ignored. Use typeless-autosend apps add/remove to update it."
 fi
 
-# Stop and verify both service names before publishing the new registration.
-# In particular, never leave the legacy job alive alongside AutoSend.
-stop_service() {
-  local label="$1"
-  launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null || true
-  if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
-    echo "Service $label could not be stopped; upgrade cancelled. Run: launchctl bootout gui/$UID_NUM/$label" >&2
-    exit 1
-  fi
-}
-stop_service "$LEGACY_LABEL"
-stop_service "$LABEL"
 rm -f "$LEGACY_PLIST"
 if [ -L "$LEGACY_LINK" ] &&
    { [ "$(readlink "$LEGACY_LINK")" = "$DIR/typeless-autoenter" ] ||
@@ -131,6 +147,13 @@ if [ -L "$LEGACY_LINK" ] &&
   rm "$LEGACY_LINK"
 fi
 if [ "$REMOVE_LEGACY_BINARY" -eq 1 ]; then rm -f "$DIR/typeless-autoenter"; fi
+
+if [ -n "$PREBUILT_BINARY" ]; then
+  cp "$SOURCE_DIR/uninstall.sh" "$DIR/uninstall.sh"
+  mkdir -p "$DIR/skill"
+  cp "$SOURCE_DIR/skill/SKILL.md" "$DIR/skill/SKILL.md"
+  cp "$SOURCE_DIR/BUILD_INFO" "$DIR/BUILD_INFO"
+fi
 
 # Request Accessibility once after a (re)install; also clear the legacy input prompt marker.
 rm -f .access-prompted .input-monitoring-prompted

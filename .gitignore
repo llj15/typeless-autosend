@@ -3,6 +3,7 @@
 # Legacy build/log artifacts kept during migration
 /typeless-autoenter
 /.build/
+/dist/
 /autosend.log
 /autoenter.log
 /autosend.log.1

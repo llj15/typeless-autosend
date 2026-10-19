@@ -2,9 +2,25 @@
 
 A macOS command-line utility and login service for Apple Silicon (ARM). After Typeless finishes a transcription, it waits before pressing Return in an application you explicitly enabled. Any user keystroke or change of input focus cancels the pending send.
 
-## Install
+## Install from a Release (recommended)
 
-Prerequisites: Typeless installed and signed in, history enabled, and Xcode Command Line Tools (`xcode-select --install`). This release targets macOS on Apple Silicon; Windows is not supported.
+Requires **macOS 15 or later on Apple Silicon (ARM64)**, with Typeless installed, signed in, and history enabled. Swift, Xcode, Node.js and npm are not needed.
+
+Download the `typeless-autosend-v1.0.0-macos-arm64.tar.gz` asset from [GitHub Releases](https://github.com/llj15/typeless-autosend/releases/latest). Choose the binary archive, not GitHub's generated **Source code** archives. Access to this private repository is required to download it.
+
+```bash
+tar -xzf typeless-autosend-v1.0.0-macos-arm64.tar.gz
+cd typeless-autosend-v1.0.0-macos-arm64
+./install.sh
+```
+
+The Release installer verifies the bundled checksums and installs the precompiled executable in `~/typeless-autosend`. An existing registered installation is upgraded in its original directory, preserving `config.json` byte for byte. You can extract the archive in Downloads and delete it after installation: the service uses the installed copy.
+
+The installer registers a login LaunchAgent and links `~/.local/bin/typeless-autosend`. If necessary it adds a marked PATH block to your zsh or bash startup file. Open a new terminal after installing. Other shells receive a manual PATH instruction. The binary is ad-hoc signed, without Developer ID signing or notarization; follow macOS's approval flow if it blocks downloaded files.
+
+## Build and install from source
+
+Source installation additionally requires Xcode Command Line Tools (`xcode-select --install`).
 
 Keep the repository in an unprotected directory, for example `~/Developer/typeless-autosend`. Do not install from Desktop, Documents, Downloads, or iCloud: the background service cannot read its files there.
 
@@ -14,11 +30,13 @@ cd ~/Developer/typeless-autosend
 ./install.sh
 ```
 
-The installer builds the native executable, registers a login LaunchAgent, and links `~/.local/bin/typeless-autosend`. If necessary it adds a marked PATH block to your zsh or bash startup file. Open a new terminal after installing. Other shells receive a manual PATH instruction.
+The source installer compiles the native executable and runs it from the repository directory. After moving a source installation, rerun `./install.sh` there to update its service and command link.
+
+## Grant Accessibility
 
 On the first service start after each install, the program requests Accessibility if needed. Later service restarts do not repeat the request. The installer opens System Settings → Privacy & Security → Accessibility; enable the executable printed by the installer, then run the printed service restart command to refresh its permission state. Accessibility provides the event access needed by this tool, so installation does not request separate Input Monitoring permission. If Settings cannot be opened, installation still finishes and prints the manual path. A rebuild can invalidate permission: remove the stale entry and add the rebuilt executable again.
 
-Fresh installations enable **no apps**. Upgrades leave your existing configuration intact. The program, config and log remain in the repository directory. After moving it, run `./install.sh` again to update the service and command link.
+Fresh installations enable **no apps**. Upgrades leave your existing configuration intact. The program, config and log remain together in the installation directory. The Release installer also copies the uninstall script, AI usage skill (`skill/SKILL.md`), and version/source information (`BUILD_INFO`) there.
 
 ## Choose applications
 
@@ -100,16 +118,26 @@ Tests compile a separate executable and use temporary SQLite databases, simulate
 
 ## Upgrade and uninstall
 
-Update the source and rerun `./install.sh` in the existing installation directory. Reauthorize the rebuilt executable as described above.
+For a Release installation, download and extract the new binary archive and run its `./install.sh`. It reuses the registered installation directory and preserves settings. For a source installation, update the source and rerun `./install.sh` in the existing directory. Reauthorize the replaced executable as described above. **Do not uninstall before upgrading**, because uninstall deletes the configuration.
 
 Upgrading from **typeless-autoenter** keeps `config.json` unchanged, including enabled apps, pause state, delays, overrides and cancellation revisions. The installer stops and checks the old `local.typeless-autoenter` service before starting `local.typeless-autosend`, removes the old LaunchAgent and its owned command link, and installs `typeless-autosend`. It migrates the shell PATH marker and writes new logs to `autosend.log`; old `autoenter.log` files remain available. If the old service cannot be stopped, the upgrade aborts before starting a new service.
 
-The installation directory may keep its old name. To rename it, move the **whole existing directory** and rerun `./install.sh`; do not install a separate checkout over a live installation. The existing instance lock and all configuration stay together. Update an existing clone's remote URL with `git remote set-url origin https://github.com/llj15/typeless-autosend.git`.
+The installation directory may keep its old name. To rename a source installation, move the **whole existing directory** and rerun its `./install.sh`; do not install a separate checkout over a live installation. The existing instance lock and all configuration stay together. Update an existing clone's remote URL with `git remote set-url origin https://github.com/llj15/typeless-autosend.git`.
 
 For scripts, `TYPELESS_AUTOSEND_CONFIG` overrides the config path. The legacy `TYPELESS_AUTOENTER_CONFIG` remains a fallback; the new variable wins if both are set.
 
 ```bash
-./uninstall.sh
+~/typeless-autosend/uninstall.sh
 ```
 
-Uninstall stops both current and legacy service names, removes their LaunchAgents and owned command links, and deletes this installation's `config.json`. If the service cannot be stopped, uninstall aborts and keeps the configuration. The repository and shared PATH block remain. Remove the Accessibility entry manually if no longer needed.
+Use the installed directory's `uninstall.sh` if it is elsewhere. Uninstall stops both current and legacy service names, removes their LaunchAgents and owned command links, and deletes this installation's `config.json`. If the service cannot be stopped, uninstall aborts and keeps the configuration. The program directory and shared PATH block remain. Remove the Accessibility entry manually if no longer needed.
+
+## Build a Release archive
+
+From a clean, committed checkout on macOS with Xcode Command Line Tools:
+
+```bash
+scripts/build-release.sh v1.0.0
+```
+
+This builds an optimized `arm64-apple-macosx15.0` binary, verifies its architecture and ad-hoc signature, checks CLI help, and writes the binary archive and `SHA256SUMS` to `dist/`. Only distribution files are included; personal configuration and runtime data are excluded. `BUILD_INFO` records the version and exact source commit. Publish the archive and its external checksum together.
