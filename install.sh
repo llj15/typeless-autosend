@@ -132,7 +132,7 @@ if [ -L "$LEGACY_LINK" ] &&
 fi
 if [ "$REMOVE_LEGACY_BINARY" -eq 1 ]; then rm -f "$DIR/typeless-autoenter"; fi
 
-# The first start after a (re)install requests any missing permissions once.
+# Request Accessibility once after a (re)install; also clear the legacy input prompt marker.
 rm -f .access-prompted .input-monitoring-prompted
 # Switch to a fresh log file so the self-check only sees records from this start,
 # not the permission state left behind by the previous binary.
@@ -234,21 +234,16 @@ echo "==> Opening privacy settings"
 if ! open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' 2>/dev/null; then
   echo "Could not open Accessibility settings. Use the manual path below." >&2
 fi
-if ! open 'x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent' 2>/dev/null; then
-  echo "Could not open Input Monitoring settings. Use the manual path below." >&2
-fi
 
 cat <<EOF
 
-System Settings may show only the last requested page (Input Monitoring).
-Opening these pages does not grant permission; enable both permissions manually.
+Opening this page does not grant permission; enable Accessibility manually.
 
 Next steps:
-  1. Enable typeless-autosend in both permission lists:
+  1. Enable typeless-autosend in Accessibility:
      System Settings → Privacy & Security → Accessibility
-     System Settings → Privacy & Security → Input Monitoring
      If the executable is missing or an entry is stale after an upgrade,
-     remove the stale entry with −, then add this same file with + in both lists:
+     remove the stale entry with −, then add this file with +:
      $DIR/typeless-autosend
      After granting permissions, restart the service to refresh its permission state:
      launchctl kickstart -k gui/$UID_NUM/$LABEL

@@ -299,6 +299,8 @@ exit(runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: Settings
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("Input Monitoring", result.stdout)
         self.assertIn("listen_permission_denied", result.stdout)
+        self.assertIn("System Settings → Privacy & Security → Accessibility", result.stdout)
+        self.assertNotIn("System Settings → Privacy & Security → Input Monitoring", result.stdout)
         self.assertNotIn("All good", result.stdout)
 
     def test_doctor_distinguishes_secure_input_from_missing_permission(self):

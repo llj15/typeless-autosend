@@ -93,27 +93,25 @@ void CGEventPost(CGEventTapLocation tap, CGEventRef event) { abort(); }
                     process.terminate()
                 process.wait(timeout=5)
 
-    def test_missing_input_permission_is_requested_when_accessibility_is_granted(self):
+    def test_input_monitoring_is_not_requested_separately(self):
         self.environment["PERMISSION_TEST_AX_GRANTED"] = "1"
         (self.directory / ".access-prompted").touch()
         self.run_daemon()
-        self.assertEqual(self.requests.read_text().splitlines() if self.requests.exists() else [],
-                         ["input_monitoring"])
+        self.assertFalse(self.requests.exists())
 
     def test_restart_does_not_repeat_a_denied_permission_request(self):
-        self.environment["PERMISSION_TEST_AX_GRANTED"] = "1"
         self.run_daemon()
         self.run_daemon()
-        self.assertEqual(self.requests.read_text().splitlines(), ["input_monitoring"])
+        self.assertEqual(self.requests.read_text().splitlines(), ["accessibility"])
 
     def test_granted_permissions_do_not_prompt(self):
         self.environment.update(PERMISSION_TEST_AX_GRANTED="1", PERMISSION_TEST_INPUT_GRANTED="1")
         self.run_daemon()
         self.assertFalse(self.requests.exists())
 
-    def test_both_missing_permissions_are_requested(self):
+    def test_missing_permissions_only_request_accessibility(self):
         self.run_daemon()
-        self.assertEqual(self.requests.read_text().splitlines(), ["accessibility", "input_monitoring"])
+        self.assertEqual(self.requests.read_text().splitlines(), ["accessibility"])
 
     def test_cli_and_simulated_service_do_not_request_permissions(self):
         cli = subprocess.run([str(self.executable), "delay", "get"], env=self.environment,

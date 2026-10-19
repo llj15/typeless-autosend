@@ -22,7 +22,6 @@ let dbPath = env["TYPELESS_DB"] ?? NSHomeDirectory() + "/Library/Application Sup
 let configPath = env["TYPELESS_AUTOSEND_CONFIG"] ?? env["TYPELESS_AUTOENTER_CONFIG"] ?? programDir + "/config.json"
 let logPath = programDir + "/autosend.log"
 let promptMarkerPath = programDir + "/.access-prompted"
-let inputPromptMarkerPath = programDir + "/.input-monitoring-prompted"
 let serviceLabel = "local.typeless-autosend"
 // Dry run: skip the real frontmost-app check and never press a key, only log (for tests).
 let dryRun = env["TYPELESS_DRY_RUN"] == "1"
@@ -297,7 +296,7 @@ func runDoctor() -> Int32 {
             let suggestion: String
             switch reason {
             case "secure_input": suggestion = "Finish secure input (for example, leave the password field), then retry."
-            case "listen_permission_denied": suggestion = "Check System Settings → Privacy & Security → Input Monitoring; after granting permission, restart the service with: launchctl kickstart -k gui/\(getuid())/\(serviceLabel)"
+            case "listen_permission_denied": suggestion = "Check System Settings → Privacy & Security → Accessibility; after granting permission, restart the service with: launchctl kickstart -k gui/\(getuid())/\(serviceLabel)"
             default: suggestion = "The service retries listener recovery once per second. If it remains unavailable, restart it with: launchctl kickstart -k gui/\(getuid())/\(serviceLabel)"
             }
             fail("Background service Input Monitoring is unavailable (\(reason)). \(suggestion)")
@@ -366,10 +365,6 @@ if dryRun {
         // restarts do not prompt again, to avoid nagging.
         FileManager.default.createFile(atPath: promptMarkerPath, contents: nil)
         _ = accessibilityTrusted(prompt: true)
-    }
-    if !CGPreflightListenEventAccess() && !FileManager.default.fileExists(atPath: inputPromptMarkerPath) {
-        FileManager.default.createFile(atPath: inputPromptMarkerPath, contents: nil)
-        _ = CGRequestListenEventAccess()
     }
     log("started, accessibility trusted=\(lastTrusted), enterDelay=\(enterDelay)s, config=\(configPath)")
 }

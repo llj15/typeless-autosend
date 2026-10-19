@@ -78,23 +78,21 @@ calls = open(f"{home}/launchctl.log").read().splitlines()
 check("both service names are stopped and checked before enable/bootstrap",
       calls == [f"bootout gui/{UID}/local.typeless-autoenter", f"print gui/{UID}/local.typeless-autoenter", f"bootout gui/{UID}/{LABEL}", f"print gui/{UID}/{LABEL}", f"enable gui/{UID}/{LABEL}", f"bootstrap gui/{UID} {plist_path}"], repr(calls))
 check(".access-prompted is cleared so the next start prompts once", not os.path.exists(f"{d}/.access-prompted"))
-check(".input-monitoring-prompted is cleared so reinstall can request permission again",
+check("the legacy input monitoring prompt marker is cleared",
       not os.path.exists(f"{d}/.input-monitoring-prompted"))
 check("the old log is kept as autosend.log.1 and the new log starts fresh",
       open(f"{d}/autosend.log.1").read() == "old-log\n" and "started," in open(f"{d}/autosend.log").read())
 check("the binary is in place and nothing is left in .build",
       os.access(f"{d}/typeless-autosend", os.X_OK) and not os.path.exists(f"{d}/.build/typeless-autosend"))
 check("output is English", "==> Building" in r.stdout and "Next steps:" in r.stdout and not CJK.search(r.stdout + r.stderr))
-check("installation requests both privacy settings pages in order",
+check("installation opens only Accessibility settings",
       os.path.exists(f"{home}/open.log") and open(f"{home}/open.log").read().splitlines() == [
-          "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-          "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"])
-check("permission guidance names both paths, the real binary and manual approval",
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
+check("permission guidance names Accessibility, the real binary and the restart command",
       "System Settings → Privacy & Security → Accessibility" in r.stdout and
-      "System Settings → Privacy & Security → Input Monitoring" in r.stdout and
+      "Input Monitoring" not in r.stdout and
       f"{real}/typeless-autosend" in r.stdout and
-      "Opening these pages does not grant permission" in r.stdout and
-      "last requested page (Input Monitoring)" in r.stdout and
+      "Opening this page does not grant permission" in r.stdout and
       "After granting permissions, restart the service" in r.stdout and
       f"launchctl kickstart -k gui/{UID}/{LABEL}" in r.stdout)
 link_path = f"{home}/.local/bin/typeless-autosend"
@@ -127,10 +125,10 @@ check("reinstall repairs owned stale command and service path", relocated.return
 print("Failure paths")
 home, d = sandbox("settings-unavailable")
 r = run("install.sh", home, d, SBX_OPEN_FAIL="1")
-check("failure to open Settings does not break installation or skip the second page",
+check("failure to open Settings does not break installation",
       r.returncode == 0 and os.path.exists(f"{home}/Library/LaunchAgents/{LABEL}.plist") and
       os.path.islink(f"{home}/.local/bin/typeless-autosend") and
-      os.path.exists(f"{home}/open.log") and len(open(f"{home}/open.log").read().splitlines()) == 2 and
+      os.path.exists(f"{home}/open.log") and len(open(f"{home}/open.log").read().splitlines()) == 1 and
       "Could not open" in r.stderr, r.stderr[-200:])
 home, d = sandbox("ta")
 r = run("install.sh", home, d, SBX_FAIL="1")
