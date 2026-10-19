@@ -17,7 +17,6 @@ private struct CLIProblem: Error {
 func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunning: () -> Bool) -> Int32? {
     guard !rawArguments.isEmpty, rawArguments.first != "doctor", rawArguments.first != "list-apps" else { return nil }
     var arguments = rawArguments
-    let dryRun = arguments.contains("--dry-run")
     let ifNotExists = arguments.contains("--if-not-exists")
     let ifExists = arguments.contains("--if-exists")
     let jsonFlag = arguments.contains("--json")
@@ -26,7 +25,7 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
         format = arguments[index + 1]
         arguments.removeSubrange(index...index + 1)
     }
-    arguments.removeAll { ["--dry-run", "--if-not-exists", "--if-exists", "--json"].contains($0) }
+    arguments.removeAll { ["--if-not-exists", "--if-exists", "--json"].contains($0) }
     var appID: String?
     if let index = arguments.firstIndex(of: "--app"), index + 1 < arguments.count {
         appID = normalizeBundleID(arguments[index + 1])
@@ -37,7 +36,7 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
         guard ["json", "table"].contains(format), !(jsonFlag && format != "json") else {
             throw CLIProblem(code: 2, type: "invalid_arguments", message: "Output format must be json or table; --json requires json", suggestion: "Use --format json or --format table")
         }
-        func emit(_ object: [String: Any]) { cliOutput(object, format: dryRun ? "json" : format) }
+        func emit(_ object: [String: Any]) { cliOutput(object, format: format) }
         if arguments.contains("--help") || arguments.contains("-h") || noun == "help" {
             let path = arguments.filter { $0 != "--help" && $0 != "-h" && $0 != "help" }
             let text = try cliHelp(path: path)
@@ -46,7 +45,6 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
         }
         let command = Array(arguments.prefix(2))
         var allowedFlags: Set<String> = ["--json", "--format"]
-        if [["apps", "add"], ["apps", "remove"], ["delay", "set"], ["delay", "reset"], ["service", "pause"], ["service", "resume"]].contains(command) { allowedFlags.insert("--dry-run") }
         if command == ["apps", "add"] { allowedFlags.insert("--if-not-exists") }
         if command == ["apps", "remove"] { allowedFlags.insert("--if-exists") }
         if noun == "delay" { allowedFlags.insert("--app") }
@@ -91,7 +89,7 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
             let settings: AutosendSettings
             if arguments[1] == "status" { settings = try store.read() }
             else {
-                settings = try store.update(dryRun: dryRun) {
+                settings = try store.update {
                     let wasPaused = $0.paused
                     $0.paused = arguments[1] == "pause"
                     if $0.paused { $0.cancellationRevision = try nextCancellationRevision($0.cancellationRevision) }
@@ -102,13 +100,13 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
             var result: [String: Any] = ["running": serviceRunning() || runtime != nil, "paused": settings.paused, "delaySeconds": settings.delaySeconds,
                   "apps": settings.apps, "configPath": store.path, "lastSkipReason": runtime?["lastSkipReason"] ?? NSNull(),
                   "pending": runtime?["pending"] ?? false, "inputMonitoringAvailable": runtime?["inputMonitoringAvailable"] ?? NSNull(),
-                  "pid": runtime?["pid"] ?? NSNull(), "updatedAt": runtime?["updatedAt"] ?? NSNull(), "dryRun": dryRun]
+                  "pid": runtime?["pid"] ?? NSNull(), "updatedAt": runtime?["updatedAt"] ?? NSNull()]
             for key in ["inputMonitoringReason", "inputMonitoringPermissionGranted", "secureInputEnabled",
                         "inputTapPresent", "inputTapValid", "inputTapSourcePresent", "inputTapEnabled", "inputMonitoringRecoveryAttempts", "inputMonitoringRecoveredAt"] {
                 result[key] = runtime?[key] ?? NSNull()
             }
             emit(result)
-            return dryRun ? 10 : 0
+            return 0
         }
         if arguments == ["delay", "get"] {
             let settings = try store.read()
@@ -119,35 +117,31 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
             guard let seconds = Double(arguments[2]), seconds.isFinite, seconds >= 0, seconds <= maximumDelaySeconds else {
                 throw CLIProblem(code: 2, type: "invalid_arguments", message: "Delay must be finite and in scheduler range 0...\(maximumDelaySeconds) seconds", suggestion: "Use a nonnegative delay such as typeless-autosend delay set 1")
             }
-            let settings = try store.update(dryRun: dryRun) {
+            let settings = try store.update {
                 if let id = appID { $0.appDelaySeconds[id] = seconds }
                 else { $0.delaySeconds = seconds }
             }
-            var result = delayResult(settings, appID: appID)
-            result["dryRun"] = dryRun
-            emit(result)
-            return dryRun ? 10 : 0
+            emit(delayResult(settings, appID: appID))
+            return 0
         }
         if arguments == ["delay", "reset"] {
-            let settings = try store.update(dryRun: dryRun) {
+            let settings = try store.update {
                 if let id = appID { $0.appDelaySeconds.removeValue(forKey: id) }
                 else { $0.delaySeconds = 1 }
             }
-            var result = delayResult(settings, appID: appID)
-            result["dryRun"] = dryRun
-            emit(result)
-            return dryRun ? 10 : 0
+            emit(delayResult(settings, appID: appID))
+            return 0
         }
         if arguments.count == 3, noun == "apps", arguments[1] == "add" {
             let id = normalizeBundleID(arguments[2])
             var changed = false
-            let result = try store.update(dryRun: dryRun) { settings in
+            let result = try store.update { settings in
                 if settings.apps.contains(where: { normalizeBundleID($0) == id }) {
                     if !ifNotExists { throw CLIProblem(code: 5, type: "already_exists", message: "App \(id) is already enabled", suggestion: "Use apps add \(id) --if-not-exists") }
                 } else { settings.apps.append(id); changed = true }
             }
-            emit(["bundleID": id, "enabled": result.apps.contains(where: { normalizeBundleID($0) == id }), "dryRun": dryRun, "changed": changed])
-            return dryRun ? 10 : 0
+            emit(["bundleID": id, "enabled": result.apps.contains(where: { normalizeBundleID($0) == id }), "changed": changed])
+            return 0
         }
         if arguments == ["apps", "list"] {
             let settings = try store.read()
@@ -162,15 +156,15 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
         if arguments.count == 3, noun == "apps", arguments[1] == "remove" {
             let id = normalizeBundleID(arguments[2])
             var changed = false
-            _ = try store.update(dryRun: dryRun) { settings in
+            _ = try store.update { settings in
                 changed = settings.apps.contains(where: { normalizeBundleID($0) == id })
                 if !changed && !ifExists { throw CLIProblem(code: 3, type: "not_found", message: "App \(id) is not enabled", suggestion: "Use apps remove \(id) --if-exists") }
                 settings.apps.removeAll { normalizeBundleID($0) == id }
                 settings.appDelaySeconds.removeValue(forKey: id)
                 if changed { settings.appCancellationRevisions[id] = try nextCancellationRevision(settings.appCancellationRevisions[id] ?? 0) }
             }
-            emit(["bundleID": id, "enabled": false, "dryRun": dryRun, "changed": changed])
-            return dryRun ? 10 : 0
+            emit(["bundleID": id, "enabled": false, "changed": changed])
+            return 0
         }
         throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unknown command or invalid arguments", suggestion: "Run typeless-autosend --help")
     } catch let error as CLIProblem {
@@ -204,7 +198,7 @@ func currentRuntimeStatus(store: SettingsStore) -> [String: Any]? {
     return state
 }
 
-private let cliExitCodes = ["0": "success", "1": "configuration or I/O error", "2": "invalid arguments", "3": "not found", "4": "permission denied", "5": "already exists", "10": "dry-run preview succeeded"]
+private let cliExitCodes = ["0": "success", "1": "configuration or I/O error", "2": "invalid arguments", "3": "not found", "4": "permission denied", "5": "already exists"]
 
 private func cliCommandSchemas() -> [[String: Any]] {
     let common: [[String: Any]] = [
@@ -212,18 +206,17 @@ private func cliCommandSchemas() -> [[String: Any]] {
         ["name": "--format", "type": "string", "required": false, "enum": ["json", "table"], "default": "table for TTY, json otherwise"],
         ["name": "--help", "type": "boolean", "required": false, "default": false, "description": "Show command help"]
     ]
-    let dry: [String: Any] = ["name": "--dry-run", "type": "boolean", "required": false, "default": false, "description": "Preview JSON without writing; exit 10"]
     let app: [String: Any] = ["name": "--app", "type": "string", "required": false, "description": "Bundle ID for an app-specific delay"]
     let entries: [(String, String, [[String: Any]], [[String: Any]], String)] = [
-        ("apps add", "Enable automatic Enter for a Bundle ID immediately", [["name": "bundle-id", "type": "string", "required": true]], [dry, ["name": "--if-not-exists", "type": "boolean", "required": false, "default": false]], "apps add com.apple.TextEdit --if-not-exists"),
-        ("apps remove", "Remove an app and its delay override", [["name": "bundle-id", "type": "string", "required": true]], [dry, ["name": "--if-exists", "type": "boolean", "required": false, "default": false]], "apps remove com.apple.TextEdit --if-exists"),
+        ("apps add", "Enable automatic Enter for a Bundle ID immediately", [["name": "bundle-id", "type": "string", "required": true]], [["name": "--if-not-exists", "type": "boolean", "required": false, "default": false]], "apps add com.apple.TextEdit --if-not-exists"),
+        ("apps remove", "Remove an app and its delay override", [["name": "bundle-id", "type": "string", "required": true]], [["name": "--if-exists", "type": "boolean", "required": false, "default": false]], "apps remove com.apple.TextEdit --if-exists"),
         ("apps list", "List enabled apps with installed and running metadata", [], [], "apps list --json"),
         ("apps search", "Search all installed apps by name or Bundle ID; no query lists all", [["name": "query", "type": "string", "required": false]], [], "apps search TextEdit"),
         ("delay get", "Read global or effective app delay in seconds", [], [app], "delay get --app com.apple.TextEdit"),
-        ("delay set", "Set delay within the supported scheduler range; fractional seconds allowed", [["name": "seconds", "type": "number", "required": true, "minimum": 0, "maximum": maximumDelaySeconds]], [app, dry], "delay set 0.5 --app com.apple.TextEdit"),
-        ("delay reset", "Restore global delay to 1 second or remove an app override", [], [app, dry], "delay reset --app com.apple.TextEdit"),
-        ("service pause", "Persistently pause automatic Enter", [], [dry], "service pause"),
-        ("service resume", "Persistently resume automatic Enter", [], [dry], "service resume"),
+        ("delay set", "Set delay within the supported scheduler range; fractional seconds allowed", [["name": "seconds", "type": "number", "required": true, "minimum": 0, "maximum": maximumDelaySeconds]], [app], "delay set 0.5 --app com.apple.TextEdit"),
+        ("delay reset", "Restore global delay to 1 second or remove an app override", [], [app], "delay reset --app com.apple.TextEdit"),
+        ("service pause", "Persistently pause automatic Enter", [], [], "service pause"),
+        ("service resume", "Persistently resume automatic Enter", [], [], "service resume"),
         ("service status", "Read service state, pause state and last skip reason", [], [], "service status --json"),
         ("doctor", "Run legacy installation and permission checks", [], [], "doctor"),
         ("list-apps", "List running apps (legacy command)", [], [["name": "--all", "type": "boolean", "required": false, "default": false]], "list-apps --all")
@@ -255,7 +248,7 @@ private func cliHelp(path: [String]) throws -> String {
         let names = flags.compactMap { $0["name"] as? String }.filter { !["--json", "--format", "--help"].contains($0) }
         if !names.isEmpty { lines.append("Optional flags: " + names.joined(separator: ", ")) }
     }
-    lines += ["", "Schema: typeless-autosend schema --all | schema <resource> <action>", "Exit codes: 0 success; 1 config/I/O; 2 usage; 3 not found; 4 permission; 5 exists; 10 dry-run", ""]
+    lines += ["", "Schema: typeless-autosend schema --all | schema <resource> <action>", "Exit codes: 0 success; 1 config/I/O; 2 usage; 3 not found; 4 permission; 5 exists", ""]
     return lines.joined(separator: "\n")
 }
 

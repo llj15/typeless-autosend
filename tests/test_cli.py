@@ -164,23 +164,19 @@ exit(runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: Settings
         self.result("service", "resume")
         self.assertEqual(json.loads(self.config.read_text())["resumeAfter"], cutoff)
 
-    def test_mutation_dry_runs_preview_without_persisting(self):
-        preview = self.command("apps", "add", "com.example.preview", "--dry-run")
-        self.assertEqual(preview.returncode, 10, preview.stderr)
-        self.assertTrue(json.loads(preview.stdout)["dryRun"])
-        self.assertEqual(self.result("apps", "list")["apps"], [])
+    def test_removed_dry_run_option_is_rejected_without_changing_settings(self):
         self.result("apps", "add", "com.example.chat")
         self.result("delay", "set", "0.5")
-        for args in [("apps", "remove", "com.example.chat"), ("delay", "set", "2"),
+        original = self.config.read_bytes()
+        for args in [("apps", "add", "com.example.other"), ("apps", "remove", "com.example.chat"), ("delay", "set", "2"),
                      ("delay", "reset"), ("delay", "set", "0", "--app", "com.example.chat"),
-                     ("service", "pause")]:
+                     ("service", "pause"), ("service", "resume")]:
             with self.subTest(args=args):
-                preview = self.command(*args, "--dry-run")
-                self.assertEqual(preview.returncode, 10, preview.stderr)
-                self.assertTrue(json.loads(preview.stdout)["dryRun"])
-        self.assertEqual(len(self.result("apps", "list")["apps"]), 1)
-        self.assertEqual(self.result("delay", "get", "--app", "com.example.chat")["delaySeconds"], 0.5)
-        self.assertFalse(self.result("service", "status")["paused"])
+                completed = self.command(*args, "--dry-run")
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(json.loads(completed.stderr)["error"], "invalid_arguments")
+                self.assertEqual(self.config.read_bytes(), original)
 
     def test_app_mutations_offer_explicit_idempotent_flags(self):
         self.result("apps", "add", "com.example.chat")
@@ -237,16 +233,18 @@ exit(runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: Settings
             self.assertEqual(process.returncode, 0, error)
         self.assertEqual(self.result("apps", "list")["count"], 16)
 
-    def test_output_formats_are_explicit_and_dry_run_stays_json(self):
-        self.result("apps", "add", "com.example.chat", "--json")
+    def test_output_formats_are_explicit(self):
+        added = self.result("apps", "add", "com.example.chat", "--json")
+        self.assertNotIn("dryRun", added)
         self.assertEqual(self.result("apps", "list", "--format", "json")["count"], 1)
         table = self.command("apps", "list", "--format", "table")
         self.assertEqual(table.returncode, 0, table.stderr)
         self.assertIn("BUNDLE ID", table.stdout)
         self.assertIn("com.example.chat", table.stdout)
-        preview = self.command("delay", "set", "2", "--format", "table", "--dry-run")
-        self.assertEqual(preview.returncode, 10, preview.stderr)
-        self.assertEqual(json.loads(preview.stdout)["delaySeconds"], 2)
+        changed = self.command("delay", "set", "2", "--format", "table")
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertIn("delaySeconds\t2", changed.stdout)
+        self.assertEqual(self.result("delay", "get")["delaySeconds"], 2)
         self.assertEqual(self.command("apps", "list", "--format", "csv").returncode, 2)
 
     def test_config_delay_overrides_are_normalized_and_invalid_delays_fail_closed(self):
@@ -277,10 +275,14 @@ exit(runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: Settings
                 completed = self.command(*args)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertIn("--json", completed.stdout)
-                self.assertIn("10", completed.stdout)
+                self.assertNotIn("--dry-run", completed.stdout)
+                self.assertNotIn("10 dry-run", completed.stdout)
                 self.assertLessEqual(len(completed.stdout.splitlines()), 50)
         schema = self.result("schema", "--all")
         self.assertEqual(schema["schemaVersion"], 1)
+        self.assertNotIn("10", schema["exitCodes"])
+        for command in schema["commands"]:
+            self.assertNotIn("--dry-run", [flag["name"] for flag in command["flags"]])
         self.assertIn("service status", [command["name"] for command in schema["commands"]])
         add = self.result("schema", "apps", "add")
         self.assertEqual(add["name"], "apps add")

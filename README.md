@@ -86,9 +86,9 @@ Commands update the sibling `config.json` atomically. Existing apps-only configu
 }
 ```
 
-Use `--help` for commands and `--json` or `--format json` for structured output. Noninteractive output defaults to JSON. Mutation commands support `--dry-run` (preview only, exit 10). `apps add --if-not-exists` and `apps remove --if-exists` allow safe repetition. `schema` describes the command interface. The older `list-apps [--all]` command still lists running apps for compatibility.
+Use `--help` for commands and `--json` or `--format json` for structured output. Noninteractive output defaults to JSON. `apps add --if-not-exists` and `apps remove --if-exists` allow safe repetition. `schema` describes the command interface. The older `list-apps [--all]` command still lists running apps for compatibility.
 
-Exit codes: 0 success, 1 general/config error, 2 invalid arguments, 3 not found, 4 permission denied, 5 conflict, 10 successful dry-run. Diagnostics go to stderr; command data goes to stdout. Legacy `doctor` and `list-apps` retain their original text output.
+Exit codes: 0 success, 1 general/config error, 2 invalid arguments, 3 not found, 4 permission denied, 5 conflict. Diagnostics go to stderr; command data goes to stdout. Legacy `doctor` and `list-apps` retain their original text output.
 
 ## Tests
 

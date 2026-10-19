@@ -158,12 +158,7 @@ struct SettingsStore {
         return settings
     }
 
-    func update(dryRun: Bool = false, _ mutate: (inout AutosendSettings) throws -> Void) throws -> AutosendSettings {
-        if dryRun {
-            var settings = try read()
-            try mutate(&settings)
-            return settings
-        }
+    func update(_ mutate: (inout AutosendSettings) throws -> Void) throws -> AutosendSettings {
         let url = URL(fileURLWithPath: path)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let fd = open(path + ".lock", O_CREAT | O_RDWR, 0o600)
