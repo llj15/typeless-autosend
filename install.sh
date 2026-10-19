@@ -1,13 +1,23 @@
 #!/bin/bash
-# typeless-autoenter installer: build in place, generate the LaunchAgent, start the service. Safe to re-run; upgrades use it too.
+# typeless-autosend installer: build in place, generate the LaunchAgent, start the service. Safe to re-run; upgrades use it too.
 # Usage: ./install.sh [--app <bundle id>]...
 #   On first install, writes these apps to the config.json whitelist; an existing config.json is left untouched.
 set -euo pipefail
 cd "$(dirname "$0")"
 DIR="$(pwd -P)"
-LABEL="local.typeless-autoenter"
+LABEL="local.typeless-autosend"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 UID_NUM="$(id -u)"
+LEGACY_LABEL="local.typeless-autoenter"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
+LEGACY_LINK="$HOME/.local/bin/typeless-autoenter"
+LEGACY_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$LEGACY_PLIST" 2>/dev/null || true)"
+REMOVE_LEGACY_BINARY=0
+if [ "$LEGACY_BINARY" = "$DIR/typeless-autoenter" ] ||
+   { [ -n "$LEGACY_BINARY" ] && [ ! -e "$LEGACY_BINARY" ] &&
+     [ -L "$LEGACY_LINK" ] && [ "$(readlink "$LEGACY_LINK")" = "$LEGACY_BINARY" ]; }; then
+  REMOVE_LEGACY_BINARY=1
+fi
 
 apps=()
 while [ $# -gt 0 ]; do
@@ -19,6 +29,17 @@ while [ $# -gt 0 ]; do
     -h|--help) sed -n '2,4p' "$0"; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
+done
+
+# A separate checkout has separate settings and a separate instance lock. Upgrade
+# in place, or move the whole existing directory, rather than silently resetting it.
+for registered_plist in "$LEGACY_PLIST" "$PLIST"; do
+  registered_binary="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$registered_plist" 2>/dev/null || true)"
+  if [ -n "$registered_binary" ] && [ -d "$(dirname "$registered_binary")" ] &&
+     [ "$(cd "$(dirname "$registered_binary")" && pwd -P)" != "$DIR" ]; then
+    echo "An existing installation is registered in $(dirname "$registered_binary"). Run install.sh there, or move that whole directory here first, to preserve its configuration and state." >&2
+    exit 1
+  fi
 done
 
 [ "$(uname)" = Darwin ] || { echo "macOS only" >&2; exit 1; }
@@ -38,19 +59,37 @@ home_lc="$(printf '%s' "$HOME" | tr '[:upper:]' '[:lower:]')"
 case "$dir_lc" in
   "$home_lc/desktop"|"$home_lc/desktop/"*|"$home_lc/documents"|"$home_lc/documents/"*|"$home_lc/downloads"|"$home_lc/downloads/"*|"$home_lc/library/mobile documents/"*|"$home_lc/library/cloudstorage/"*)
     echo "This directory is in a macOS protected location (Desktop / Documents / Downloads / iCloud): $DIR" >&2
-    echo "The background service cannot read files there. Move the whole directory elsewhere, e.g. ~/Developer/typeless-autoenter, then run ./install.sh again." >&2
+    echo "The background service cannot read files there. Move the whole directory elsewhere, e.g. ~/Developer/typeless-autosend, then run ./install.sh again." >&2
     exit 1 ;;
 esac
 if [ ! -d /Applications/Typeless.app ] && [ ! -d "$HOME/Applications/Typeless.app" ]; then
   echo "Warning: Typeless.app not found; continuing anyway (ignore this if it lives elsewhere)"
 fi
 
+# Never replace a command owned by another installation or tool.
+BIN_DIR="$HOME/.local/bin"
+COMMAND_LINK="$BIN_DIR/typeless-autosend"
+RELOCATE_LINK=0
+if [ -e "$COMMAND_LINK" ] || [ -L "$COMMAND_LINK" ]; then
+  if [ ! -L "$COMMAND_LINK" ] || [ "$(readlink "$COMMAND_LINK")" != "$DIR/typeless-autosend" ]; then
+    # A dangling link matching our registered LaunchAgent belongs to the moved install.
+    registered_binary="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null || true)"
+    if [ -L "$COMMAND_LINK" ] && [ ! -e "$COMMAND_LINK" ] &&
+       [ -n "$registered_binary" ] && [ "$(readlink "$COMMAND_LINK")" = "$registered_binary" ]; then
+      RELOCATE_LINK=1
+    else
+      echo "Command already exists: $COMMAND_LINK. Remove or relocate it before installing." >&2
+      exit 1
+    fi
+  fi
+fi
+
 echo "==> Building"
 # Build into a temp directory first, then replace: no half-written binary is left behind,
-# and the code-signing identifier stays typeless-autoenter.
+# and the code-signing identifier stays typeless-autosend.
 mkdir -p .build
-swiftc -O main.swift -o .build/typeless-autoenter -lsqlite3
-mv .build/typeless-autoenter typeless-autoenter
+swiftc -O ./*.swift -o .build/typeless-autosend -lsqlite3
+mv .build/typeless-autosend typeless-autosend
 
 if [ ! -f config.json ]; then
   echo "==> Creating config.json"
@@ -70,14 +109,34 @@ if [ ! -f config.json ]; then
     cp config.example.json config.json
   fi
 elif [ ${#apps[@]} -gt 0 ]; then
-  echo "Note: config.json already exists and was left untouched; --app was ignored. Edit config.json directly."
+  echo "Note: config.json already exists and was left untouched; --app was ignored. Use typeless-autosend apps add/remove to update it."
 fi
 
-# The first start after a (re)install shows the Accessibility prompt once.
-rm -f .access-prompted
+# Stop and verify both service names before publishing the new registration.
+# In particular, never leave the legacy job alive alongside AutoSend.
+stop_service() {
+  local label="$1"
+  launchctl bootout "gui/$UID_NUM/$label" 2>/dev/null || true
+  if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+    echo "Service $label could not be stopped; upgrade cancelled. Run: launchctl bootout gui/$UID_NUM/$label" >&2
+    exit 1
+  fi
+}
+stop_service "$LEGACY_LABEL"
+stop_service "$LABEL"
+rm -f "$LEGACY_PLIST"
+if [ -L "$LEGACY_LINK" ] &&
+   { [ "$(readlink "$LEGACY_LINK")" = "$DIR/typeless-autoenter" ] ||
+     { [ -n "$LEGACY_BINARY" ] && [ "$(readlink "$LEGACY_LINK")" = "$LEGACY_BINARY" ]; }; }; then
+  rm "$LEGACY_LINK"
+fi
+if [ "$REMOVE_LEGACY_BINARY" -eq 1 ]; then rm -f "$DIR/typeless-autoenter"; fi
+
+# Request Accessibility once after a (re)install; also clear the legacy input prompt marker.
+rm -f .access-prompted .input-monitoring-prompted
 # Switch to a fresh log file so the self-check only sees records from this start,
 # not the permission state left behind by the previous binary.
-if [ -f autoenter.log ]; then mv -f autoenter.log autoenter.log.1; fi
+if [ -f autosend.log ]; then mv -f autosend.log autosend.log.1; fi
 
 echo "==> Registering and starting the service ($LABEL)"
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -90,7 +149,7 @@ cat > "$PLIST" <<EOF
     <string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$DIR/typeless-autoenter</string>
+        <string>$DIR/typeless-autosend</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -104,15 +163,14 @@ cat > "$PLIST" <<EOF
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>$DIR/autoenter.log</string>
+    <string>$DIR/autosend.log</string>
     <key>StandardErrorPath</key>
-    <string>$DIR/autoenter.log</string>
+    <string>$DIR/autosend.log</string>
 </dict>
 </plist>
 EOF
 plutil -lint "$PLIST" >/dev/null
 
-launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
 launchctl enable "gui/$UID_NUM/$LABEL" 2>/dev/null || true
 loaded=0
 err=""
@@ -122,28 +180,76 @@ for _ in 1 2 3 4 5; do
 done
 if [ "$loaded" -ne 1 ]; then
   echo "launchctl bootstrap failed: $err" >&2
-  echo "Check: System Settings → General → Login Items & Extensions, and make sure typeless-autoenter is not switched off." >&2
+  echo "Check: System Settings → General → Login Items & Extensions, and make sure typeless-autosend is not switched off." >&2
   echo "You can also run launchctl print-disabled gui/$UID_NUM | grep typeless to see whether it is disabled." >&2
   exit 1
 fi
 # Wait for the service to write its start record (up to 10 seconds).
 for _ in $(seq 1 20); do
-  grep -qs "started," autoenter.log && break
+  grep -qs "started," autosend.log && break
   sleep 0.5
 done
 
+echo "==> Installing command in $BIN_DIR"
+mkdir -p "$BIN_DIR"
+if [ "$RELOCATE_LINK" -eq 1 ]; then rm "$COMMAND_LINK"; fi
+if [ ! -L "$COMMAND_LINK" ]; then ln -s "$DIR/typeless-autosend" "$COMMAND_LINK"; fi
+# Configure only the login user's shell. Never duplicate our marked block.
+case "${SHELL:-/bin/zsh}" in
+  */zsh) SHELL_PROFILE="${ZDOTDIR:-$HOME}/.zshrc" ;;
+  */bash) SHELL_PROFILE="$HOME/.bash_profile" ;;
+  *) SHELL_PROFILE="" ;;
+esac
+# Rename our old markers without changing the user's PATH code or other settings.
+if [ -n "$SHELL_PROFILE" ] && grep -Fq '# >>> typeless-autoenter PATH >>>' "$SHELL_PROFILE" 2>/dev/null; then
+  sed -i '' 's/# >>> typeless-autoenter PATH >>>/# >>> typeless-autosend PATH >>>/; s/# <<< typeless-autoenter PATH <<</# <<< typeless-autosend PATH <<</' "$SHELL_PROFILE"
+fi
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *)
+    if [ -n "$SHELL_PROFILE" ]; then
+      if ! grep -Fq '# >>> typeless-autosend PATH >>>' "$SHELL_PROFILE" 2>/dev/null; then
+        mkdir -p "$(dirname "$SHELL_PROFILE")"
+        cat >> "$SHELL_PROFILE" <<'PATH_BLOCK'
+
+# >>> typeless-autosend PATH >>>
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+# <<< typeless-autosend PATH <<<
+PATH_BLOCK
+      fi
+      echo "Open a new terminal, or source: $SHELL_PROFILE"
+    else
+      echo 'Add $HOME/.local/bin to your shell PATH to use the command from any directory.'
+    fi
+    ;;
+esac
+
 echo "==> Self-check"
-./typeless-autoenter doctor || true
+./typeless-autosend doctor || true
+
+echo "==> Opening privacy settings"
+if ! open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' 2>/dev/null; then
+  echo "Could not open Accessibility settings. Use the manual path below." >&2
+fi
 
 cat <<EOF
 
+Opening this page does not grant permission; enable Accessibility manually.
+
 Next steps:
-  1. Grant Accessibility permission: System Settings → Privacy & Security → Accessibility,
-     then switch on typeless-autoenter.
-     If no prompt appeared, or an old entry is already listed (entries go stale after an upgrade):
-     remove it with −, then add this file with +
-     $DIR/typeless-autoenter
-  2. Put the apps that should get the automatic Enter into the apps array in $DIR/config.json.
-     Run ./typeless-autoenter list-apps to see the Bundle IDs of running apps.
-  3. Run ./typeless-autoenter doctor at any time to check the status. Log: $DIR/autoenter.log
+  1. Enable typeless-autosend in Accessibility:
+     System Settings → Privacy & Security → Accessibility
+     If the executable is missing or an entry is stale after an upgrade,
+     remove the stale entry with −, then add this file with +:
+     $DIR/typeless-autosend
+     After granting permissions, restart the service to refresh its permission state:
+     launchctl kickstart -k gui/$UID_NUM/$LABEL
+  2. Find installed applications: typeless-autosend apps search <name>
+     Enable one by Bundle ID: typeless-autosend apps add <bundle.id>
+  3. Configure the delay: typeless-autosend delay set 1
+     Pause/resume: typeless-autosend service pause / service resume
+  4. Check: typeless-autosend service status / doctor. Log: $DIR/autosend.log
 EOF

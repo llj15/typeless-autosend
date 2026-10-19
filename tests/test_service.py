@@ -16,8 +16,8 @@ def copy_binary(subdir):
     d = f"{WORK}/{subdir}"
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
-    shutil.copy(BIN, f"{d}/typeless-autoenter")
-    return d, f"{d}/typeless-autoenter"
+    shutil.copy(BIN, f"{d}/typeless-autosend")
+    return d, f"{d}/typeless-autosend"
 
 
 print("Single-instance lock")
@@ -31,9 +31,9 @@ time.sleep(2.2)
 check("a second instance gives up and exits with status 0", second.poll() == 0, f"(poll={second.poll()})")
 check("and says why", "another instance is already running" in text(f"{WORK}/h2.log"))
 check("the first instance keeps running", first.poll() is None)
-r = subprocess.run([b, "doctor"], env=dict(os.environ, TYPELESS_DB=f"{WORK}/h.db", TYPELESS_AUTOENTER_CONFIG=f"{WORK}/none.json"),
+r = subprocess.run([b, "doctor"], env=dict(os.environ, TYPELESS_DB=f"{WORK}/h.db", TYPELESS_AUTOSEND_CONFIG=f"{WORK}/none.json"),
                    capture_output=True, text=True)
-check("doctor does not need the lock", "typeless-autoenter doctor" in r.stdout)
+check("doctor does not need the lock", "typeless-autosend doctor" in r.stdout)
 row(conn, "handled_once")
 time.sleep(0.8)
 check("only the lock holder handles records", text(f"{WORK}/h1.log").count("would enter id=handled_once ") == 1)

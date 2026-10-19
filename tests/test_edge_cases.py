@@ -98,13 +98,20 @@ direct = f"{WORK}/default-config"
 shutil.rmtree(direct, ignore_errors=True)
 os.makedirs(direct)
 os.makedirs(f"{WORK}/links", exist_ok=True)
-shutil.copy(BIN, f"{direct}/typeless-autoenter")
-open(f"{direct}/config.json", "w").write(f'{{"apps": ["{SLACK}"]}}')
+shutil.copy(BIN, f"{direct}/typeless-autosend")
+open(f"{direct}/config.json", "w").write(f'{{"apps": ["{SLACK}"], "delaySeconds": 0}}')
 link = f"{WORK}/links/via-symlink"
 if os.path.lexists(link):
     os.remove(link)
-os.symlink(f"{direct}/typeless-autoenter", link)
-for how, binary in (("started directly", f"{direct}/typeless-autoenter"), ("started via symlink", link)):
+os.symlink(f"{direct}/typeless-autosend", link)
+# Ambient old/new overrides must never escape the dry-run test sandbox.
+foreign = f"{WORK}/foreign-config"
+os.makedirs(foreign, exist_ok=True)
+open(f"{foreign}/config.json", "w").write('{"apps": []}')
+saved_overrides = {key: os.environ.get(key) for key in ("TYPELESS_AUTOENTER_CONFIG", "TYPELESS_AUTOSEND_CONFIG")}
+for key in saved_overrides:
+    os.environ[key] = f"{foreign}/config.json"
+for how, binary in (("started directly", f"{direct}/typeless-autosend"), ("started via symlink", link)):
     db, log = f"{WORK}/e6.db", f"{WORK}/e6.log"
     conn = newdb(db)
     row(conn, "base")
@@ -115,8 +122,15 @@ for how, binary in (("started directly", f"{direct}/typeless-autoenter"), ("star
     stop(p)
     conn.close()
     check(f"{how}: reads config.json from the executable's directory", outcome(log, "uses_sibling_config") == "enter")
+check("ambient configuration overrides cannot write runtime state outside the daemon fixture",
+      not os.path.exists(f"{foreign}/runtime-status.json"))
+for key, value in saved_overrides.items():
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
 
 print("Unknown subcommand")
 r = subprocess.run([BIN, "bogus"], capture_output=True, text=True)
-check("exits with status 2 and prints the usage", r.returncode == 2 and "usage:" in r.stderr)
+check("exits with status 2 and points to help", r.returncode == 2 and "--help" in r.stderr)
 finish()

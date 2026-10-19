@@ -7,7 +7,7 @@ rm -rf .work
 mkdir -p .work
 
 echo "==> Building"
-swiftc -O ../main.swift -o .work/typeless-autoenter -lsqlite3
+swiftc -O ../*.swift -o .work/typeless-autosend -lsqlite3
 
 failed=0
 for t in test_*.py; do

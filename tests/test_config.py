@@ -11,7 +11,7 @@ GHOSTTY, SLACK = "com.mitchellh.ghostty", "com.tinyspeck.slackmacgap"
 
 
 def apps(*ids):
-    return json.dumps({"apps": list(ids)})
+    return json.dumps({"apps": list(ids), "delaySeconds": 0})
 
 
 def run(front, cases):

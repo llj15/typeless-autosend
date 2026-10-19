@@ -1,6 +1,7 @@
-"""install.sh and uninstall.sh in a sandbox: fake HOME, with stub swiftc and launchctl first on PATH.
-Nothing here touches the real service or the real LaunchAgents folder."""
+"""install.sh and uninstall.sh in a sandbox: fake HOME, with stub swiftc, launchctl and open first on PATH.
+Nothing here touches the real service, LaunchAgents folder or System Settings."""
 import json
+import glob
 import os
 import plistlib
 import re
@@ -13,7 +14,7 @@ from common import *  # noqa: E402,F403
 
 SBX = f"{WORK}/sbx"
 STUBS = f"{SBX}/stubs"
-LABEL = "local.typeless-autoenter"
+LABEL = "local.typeless-autosend"
 UID = str(os.getuid())
 CJK = re.compile("[" + chr(0x4E00) + "-" + chr(0x9FFF) + "]")  # any Chinese character
 _homes = iter(range(10**6))
@@ -30,12 +31,16 @@ echo "$*" >> "$SBX_LOG"
 case "$1" in
   bootstrap)
     if [ "${SBX_FAIL:-0}" = 1 ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi
-    echo "[stub] started, accessibility trusted=false" >> "$SBX_APPDIR/autoenter.log" ;;
+    echo "[stub] started, accessibility trusted=false" >> "$SBX_APPDIR/autosend.log" ;;
   print) [ "${SBX_PRINT_OK:-0}" = 1 ] && exit 0 || exit 1 ;;
 esac
 exit 0
 """)
-for stub in ("swiftc", "launchctl"):
+open(f"{STUBS}/open", "w").write("""#!/bin/bash
+printf '%s\\n' "$@" >> "$HOME/open.log"
+exit "${SBX_OPEN_FAIL:-0}"
+""")
+for stub in ("swiftc", "launchctl", "open"):
     os.chmod(f"{STUBS}/{stub}", 0o755)
 
 
@@ -43,45 +48,88 @@ def sandbox(sub):
     home = f"{SBX}/home-{next(_homes)}"
     d = f"{home}/{sub}"
     os.makedirs(d)
-    for f in ("install.sh", "main.swift", "config.example.json", "uninstall.sh"):
+    for f in ("install.sh", "config.example.json", "uninstall.sh", *[os.path.basename(p) for p in glob.glob(f"{ROOT}/*.swift")]):
         shutil.copy(f"{ROOT}/{f}", d)
     return home, d
 
 
 def run(script, home, d, *args, **extra):
-    env = dict(os.environ, HOME=home, PATH=f"{STUBS}:/usr/bin:/bin", SBX_LOG=f"{home}/launchctl.log", SBX_APPDIR=d)
+    env = dict(os.environ, HOME=home, PATH=f"{STUBS}:/usr/bin:/bin", SHELL="/bin/zsh", SBX_LOG=f"{home}/launchctl.log", SBX_APPDIR=d)
     env.update(extra)
     return subprocess.run(["/bin/bash", script, *args], cwd=d, env=env, capture_output=True, text=True)
 
 
 print("Normal install (directory with a space, two --app flags)")
-home, d = sandbox("My Tools/typeless-autoenter")
+home, d = sandbox("My Tools/typeless-autosend")
 real = os.path.realpath(d)
 open(f"{d}/.access-prompted", "w").close()
-open(f"{d}/autoenter.log", "w").write("old-log\n")
+open(f"{d}/.input-monitoring-prompted", "w").close()
+open(f"{d}/autosend.log", "w").write("old-log\n")
 r = run("install.sh", home, d, "--app", "com.example.one", "--app", "com.example.two")
 check("exits 0", r.returncode == 0, r.stderr[-200:])
 check("config.json is created from --app", json.load(open(f"{d}/config.json")) == {"apps": ["com.example.one", "com.example.two"]})
 plist_path = f"{home}/Library/LaunchAgents/{LABEL}.plist"
 plist = plistlib.load(open(plist_path, "rb"))
 check("plist points at the install directory, space included",
-      plist["ProgramArguments"] == [f"{real}/typeless-autoenter"] and plist["StandardOutPath"] == f"{real}/autoenter.log")
+      plist["ProgramArguments"] == [f"{real}/typeless-autosend"] and plist["StandardOutPath"] == f"{real}/autosend.log")
 check("plist label, KeepAlive and throttle",
       plist["Label"] == LABEL and plist["KeepAlive"] == {"SuccessfulExit": False} and plist["ThrottleInterval"] == 10)
 calls = open(f"{home}/launchctl.log").read().splitlines()
-check("launchctl is called as bootout, enable, bootstrap",
-      calls == [f"bootout gui/{UID}/{LABEL}", f"enable gui/{UID}/{LABEL}", f"bootstrap gui/{UID} {plist_path}"], repr(calls))
+check("both service names are stopped and checked before enable/bootstrap",
+      calls == [f"bootout gui/{UID}/local.typeless-autoenter", f"print gui/{UID}/local.typeless-autoenter", f"bootout gui/{UID}/{LABEL}", f"print gui/{UID}/{LABEL}", f"enable gui/{UID}/{LABEL}", f"bootstrap gui/{UID} {plist_path}"], repr(calls))
 check(".access-prompted is cleared so the next start prompts once", not os.path.exists(f"{d}/.access-prompted"))
-check("the old log is kept as autoenter.log.1 and the new log starts fresh",
-      open(f"{d}/autoenter.log.1").read() == "old-log\n" and "started," in open(f"{d}/autoenter.log").read())
+check("the legacy input monitoring prompt marker is cleared",
+      not os.path.exists(f"{d}/.input-monitoring-prompted"))
+check("the old log is kept as autosend.log.1 and the new log starts fresh",
+      open(f"{d}/autosend.log.1").read() == "old-log\n" and "started," in open(f"{d}/autosend.log").read())
 check("the binary is in place and nothing is left in .build",
-      os.access(f"{d}/typeless-autoenter", os.X_OK) and not os.path.exists(f"{d}/.build/typeless-autoenter"))
+      os.access(f"{d}/typeless-autosend", os.X_OK) and not os.path.exists(f"{d}/.build/typeless-autosend"))
 check("output is English", "==> Building" in r.stdout and "Next steps:" in r.stdout and not CJK.search(r.stdout + r.stderr))
+check("installation opens only Accessibility settings",
+      os.path.exists(f"{home}/open.log") and open(f"{home}/open.log").read().splitlines() == [
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
+check("permission guidance names Accessibility, the real binary and the restart command",
+      "System Settings → Privacy & Security → Accessibility" in r.stdout and
+      "Input Monitoring" not in r.stdout and
+      f"{real}/typeless-autosend" in r.stdout and
+      "Opening this page does not grant permission" in r.stdout and
+      "After granting permissions, restart the service" in r.stdout and
+      f"launchctl kickstart -k gui/{UID}/{LABEL}" in r.stdout)
+link_path = f"{home}/.local/bin/typeless-autosend"
+check("installs globally callable link", os.path.islink(link_path) and os.path.realpath(link_path) == f"{real}/typeless-autosend")
+profile = f"{home}/.zshrc"
+profile_text = open(profile).read() if os.path.exists(profile) else ""
+check("adds marked PATH setup for zsh", "# >>> typeless-autosend PATH >>>" in profile_text)
+shell = subprocess.run(["/bin/zsh", "-c", 'source "$HOME/.zshrc"; command -v typeless-autosend'],
+                       env=dict(os.environ, HOME=home, PATH="/usr/bin:/bin"), capture_output=True, text=True)
+check("new shell can find global command", shell.returncode == 0 and shell.stdout.strip() == link_path)
 again = run("install.sh", home, d, "--app", "com.example.three")
+check("PATH setup is idempotent", os.path.exists(profile) and open(profile).read().count("# >>> typeless-autosend PATH >>>") == 1)
 check("--app is ignored with a notice when config.json already exists",
       "left untouched" in again.stdout and json.load(open(f"{d}/config.json"))["apps"] == ["com.example.one", "com.example.two"])
 
+uninstalled = run("uninstall.sh", home, d)
+check("uninstall removes only its own global link", uninstalled.returncode == 0 and not os.path.lexists(link_path))
+check("uninstall removes config and preserves harmless shared PATH setup", not os.path.exists(f"{d}/config.json") and os.path.exists(profile))
+
+print("Reinstall after moving the installed directory")
+home, d = sandbox("old-location")
+first = run("install.sh", home, d)
+moved = f"{home}/new-location"
+os.rename(d, moved)
+relocated = run("install.sh", home, moved)
+check("reinstall repairs owned stale command and service path", relocated.returncode == 0 and
+      os.path.realpath(f"{home}/.local/bin/typeless-autosend") == f"{moved}/typeless-autosend",
+      relocated.stderr[-200:])
+
 print("Failure paths")
+home, d = sandbox("settings-unavailable")
+r = run("install.sh", home, d, SBX_OPEN_FAIL="1")
+check("failure to open Settings does not break installation",
+      r.returncode == 0 and os.path.exists(f"{home}/Library/LaunchAgents/{LABEL}.plist") and
+      os.path.islink(f"{home}/.local/bin/typeless-autosend") and
+      os.path.exists(f"{home}/open.log") and len(open(f"{home}/open.log").read().splitlines()) == 1 and
+      "Could not open" in r.stderr, r.stderr[-200:])
 home, d = sandbox("ta")
 r = run("install.sh", home, d, SBX_FAIL="1")
 check("bootstrap failure: exit 1, the reason and the Login Items hint",
@@ -106,7 +154,7 @@ for sub in ("Desktop/ta", "desktop/ta", "DOWNLOADS/ta", "Documents/x/y", "docume
             "Library/Mobile Documents/com~apple~CloudDocs/ta", "library/cloudstorage/ta"):
     home, d = sandbox(sub)
     r = run("install.sh", home, d)
-    check(sub, r.returncode == 1 and "protected location" in r.stderr and not os.path.exists(f"{d}/typeless-autoenter")
+    check(sub, r.returncode == 1 and "protected location" in r.stderr and not os.path.exists(f"{d}/typeless-autosend")
           and not os.path.exists(f"{home}/launchctl.log"), f"(rc={r.returncode})")
 home, d = sandbox("Developer/ta")
 r = run("install.sh", home, d)

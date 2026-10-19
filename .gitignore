@@ -1,12 +1,22 @@
 # Build output and runtime files for this machine
+/typeless-autosend
+# Legacy build/log artifacts kept during migration
 /typeless-autoenter
 /.build/
+/autosend.log
 /autoenter.log
+/autosend.log.1
 /autoenter.log.1
 /.access-prompted
+/.input-monitoring-prompted
 /.lock
 # Personal whitelist; see config.example.json for the template
 /config.json
 .DS_Store
 /tests/.work/
 /tests/__pycache__/
+
+# Isolated feature test binaries and runtime state
+/tests/.*-work/
+/runtime-status.json
+/config.json.lock
