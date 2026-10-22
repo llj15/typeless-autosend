@@ -22,6 +22,8 @@ Expiry relies on the latest foreground observations and notifications, then chec
 
 Each captured paste is consumed once and associated with a local database record. A paste observed while the newest local record is incomplete cannot establish that association; the implementation waits for a matching capture and eventually skips a stale completion. This prevents a delayed paste from an older dictation from being assigned to a newly started recording. No clipboard text is read.
 
+If a real captured paste has a nonempty transcript but the settled value is empty or unchanged from the pre-paste snapshot, the attempt skips unless a reported selection proves an identical-text replacement. A capture event alone does not prove that the application accepted the paste. This avoids submitting an empty input or a pre-existing draft after an ineffective paste. Replacing a reported selection with the same nonempty text remains supported; without selection information, an unchanged value cannot establish that replacement.
+
 Content alignment protects the pasted lines and accepts refreshes elsewhere. Ambiguous alignment, an unknown selection replacement that cannot be recovered, or an alignment larger than the configured bounds uses the whole input as a baseline. These cases may cancel on unrelated refreshes. A buffer edit is cancelled when the before/after snapshots establish that the protected content or caret was changed; an unresolvable snapshot still uses the documented whole-input fallback.
 
 ## Verification boundary

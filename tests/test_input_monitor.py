@@ -156,6 +156,64 @@ do {
     m.handleAXNotification(kAXFocusedUIElementChangedNotification, token: staleObserver, element: staleElement)
     expect(delivered(m), "old observer and old epoch cannot cancel a new attempt")
 }
+// A nonempty but unchanged input is also a failed paste unless a trusted
+// selection proves that the transcription replaced exactly the same text.
+for selectionAvailable in [true, false] {
+    let m = make(requirePaste: true)
+    event(m, "state", ["text": "> ", "caret": 0, "selectionAvailable": selectionAvailable])
+    event(m, "typeless_paste")
+    guard case .success(let f) = m.beginAttempt() else { fatalError("unchanged nonempty paste target") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(!delivered(m), "unchanged nonempty snapshot B without a trusted replacement cannot send")
+}
+// The actual event-thread timer branch must retry state-lock contention,
+// rather than interpreting an unrelated AX read as a cancelled countdown.
+do {
+    let m = make(); arm(m)
+    let epoch = m.currentObservationToken!.epoch
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "delivery-lock-record" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "delivery worker holds state lock")
+    var result: Bool?
+    var completions = 0
+    m.performDelivery(epoch: epoch) { result = $0; completions += 1 }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.03))
+    let completedWhileLocked = result != nil
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "delivery worker releases state lock")
+    expect(!completedWhileLocked, "contended delivery never completes early as a failure")
+    let deadline = Date().addingTimeInterval(2)
+    while result == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+    expect(result == true && completions == 1, "released unchanged delivery succeeds exactly once")
+}
+for rearm in [false, true] {
+    let m = make(); arm(m)
+    let oldEpoch = m.currentObservationToken!.epoch
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "cancelled-delivery-lock-record" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "old delivery worker holds state lock")
+    var oldResult: Bool?
+    var oldCompletions = 0
+    m.performDelivery(epoch: oldEpoch) { oldResult = $0; oldCompletions += 1 }
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "old delivery worker releases state lock")
+    _ = m.endAttempt()
+    if rearm {
+        guard case .success(let f) = m.currentFocus() else { fatalError("rearmed retry target") }
+        m.armAttempt(focus: f, authorize: { true }); m.settleAttempt()
+    }
+    let deadline = Date().addingTimeInterval(2)
+    while oldResult == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+    expect(oldResult == false && oldCompletions == 1, "cancelled old delivery retry completes once without sending")
+    expect(!m.sentAwaitingReport, "old delivery retry never sends after cancellation or into new attempt")
+    if rearm { expect(delivered(m), "old epoch retry cannot cancel a newly armed attempt") }
+}
 // A missed verified paste invalidates its cached target without poisoning
 // the current countdown. A later record cannot consume an older capture.
 do {
@@ -366,6 +424,32 @@ do {
     let m = make(); arm(m)
     event(m, "capability", ["identityReadable": false])
     expect(!valid(m), "foreground identity inspection failure cancels")
+}
+// A verified paste event alone is not evidence that any text reached the
+// input. A completely empty snapshot B must never cause an empty Return.
+do {
+    let m = make(requirePaste: true)
+    event(m, "typeless_paste")
+    guard case .success(let f) = m.beginAttempt() else { fatalError("empty captured paste") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(!delivered(m), "empty snapshot B without observed pasted text cannot send")
+}
+do {
+    let m = make(requirePaste: true)
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "hello", "caret": 5])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("normal captured paste") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(delivered(m), "observed nonempty paste still sends")
+}
+do {
+    let m = make(requirePaste: true)
+    event(m, "state", ["text": "hello", "caret": 0, "selectionLength": 5])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "hello", "caret": 5, "selectionLength": 0])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("identical selected-text replacement") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(delivered(m), "same nonempty text replacing a selection is a valid paste")
 }
 // Buffering may finish the system paste, but may not absorb an intervening
 // user edit into snapshot B. The same protection works without caret metadata.

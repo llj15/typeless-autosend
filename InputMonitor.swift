@@ -713,10 +713,27 @@ final class InputMonitor {
             cancelFromEvent("cannot settle original input"); return
         }
         guard originalIdentityUnchanged(original) else { return }
+        if consumedPaste != nil, !pastedText.isEmpty, current.text.isEmpty {
+            cancelFromEvent("no pasted text observed in original input")
+            return
+        }
         let before = consumedPaste?.focus
         let reportsSelection = before?.selectionAvailable == true && current.selectionAvailable &&
             (before?.selectionStart != 0 || before?.selectionLength != 0 || current.selectionStart != 0 || current.selectionLength != 0)
         if let before, !pastedText.isEmpty {
+            if before.text == current.text {
+                let text = before.text as NSString
+                let (expectedCaret, overflow) = before.selectionStart.addingReportingOverflow(pastedText.utf16.count)
+                let trustedSameTextReplacement = before.selectionAvailable && current.selectionAvailable &&
+                    before.selectionStart >= 0 && before.selectionLength > 0 &&
+                    before.selectionStart <= text.length && before.selectionLength <= text.length - before.selectionStart &&
+                    text.substring(with: NSRange(location: before.selectionStart, length: before.selectionLength)) == pastedText &&
+                    !overflow && current.selectionStart == expectedCaret && current.selectionLength == 0
+                guard trustedSameTextReplacement else {
+                    cancelFromEvent("no pasted text observed in original input")
+                    return
+                }
+            }
             if PasteBaseline.settlementWasEdited(beforeText: before.text,
                 insertionStart: reportsSelection ? before.selectionStart : nil,
                 insertionLength: reportsSelection ? before.selectionLength : 0,
@@ -788,10 +805,14 @@ final class InputMonitor {
         } else { completion(false) }
     }
 
-    private func performDelivery(epoch: Int, completion: @escaping (Bool) -> Void) {
+    func performDelivery(epoch: Int, completion: @escaping (Bool) -> Void) {
         guard stateLock.try() else {
-            // A timer losing the lock must not invalidate another attempt.
-            DispatchQueue.main.async { completion(false) }
+            // Contention with an AX read is not cancellation. Retry the same
+            // epoch after a short main-queue backoff; the eventual epoch/active
+            // checks prevent an ended attempt from reviving or affecting a new one.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(5)) { [self] in
+                scheduleDelivery(epoch: epoch, completion: completion)
+            }
             return
         }
         defer { stateLock.unlock() }
