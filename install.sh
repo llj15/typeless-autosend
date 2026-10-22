@@ -301,16 +301,18 @@ if [ "$doctor_status" -ne 0 ] && printf '%s\n' "$doctor_output" | grep -Eq '^  �
 
   cat <<EOF
 
-Opening this page does not grant permission; enable Accessibility manually.
+Required permission is missing. Opening this page does not grant permission.
 
 Permission setup:
-     Enable typeless-autosend in Accessibility:
-     System Settings → Privacy & Security → Accessibility
-     If the executable is missing or an entry is stale after an upgrade,
-     remove the stale entry with −, then add this file with +:
+     In System Settings → Privacy & Security → Accessibility:
+  1. Remove the existing typeless-autosend entry with − (skip if there is no entry).
+  2. Click + and add the current executable:
      $DIR/typeless-autosend
-     After granting permissions, restart the service to refresh its permission state:
+  3. Turn on its Accessibility switch.
+  4. Restart the service and verify permission:
      launchctl kickstart -k gui/$UID_NUM/$LABEL
+     typeless-autosend doctor
+     All good means setup is complete.
 EOF
 elif [ "$doctor_status" -ne 0 ]; then
   echo "Resolve the self-check issues above, then run: typeless-autosend doctor"

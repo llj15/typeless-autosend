@@ -107,7 +107,10 @@ check("permission guidance names Accessibility, the real binary and the restart 
       "Input Monitoring" not in r.stdout and
       f"{real}/typeless-autosend" in r.stdout and
       "Opening this page does not grant permission" in r.stdout and
-      "After granting permissions, restart the service" in r.stdout and
+      "Remove the existing typeless-autosend entry with −" in r.stdout and
+      "Click + and add the current executable" in r.stdout and
+      "Turn on its Accessibility switch" in r.stdout and
+      "Restart the service and verify permission" in r.stdout and
       f"launchctl kickstart -k gui/{UID}/{LABEL}" in r.stdout)
 link_path = f"{home}/.local/bin/typeless-autosend"
 check("installs globally callable link", os.path.islink(link_path) and os.path.realpath(link_path) == f"{real}/typeless-autosend")
