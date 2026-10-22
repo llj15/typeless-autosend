@@ -10,7 +10,13 @@ Consequently, posting Return after another input or window has gained focus can 
 
 The implementation cancels when it observes such a completed focus change. It also cancels a departure during the paste buffer if focus has already moved to a different input before settlement. Outside clicks after settlement can still post while their event-tap callback holds the click. The callback orders the post call before releasing the click; unit tests do not establish the receiving application's native processing order.
 
+Departure requires confirmation of the original application's focused window and input identity. An unreadable identity cancels instead of treating an unknown receiver as the original input. This adds a cancellation case beyond the original design. Content reads and identity reads are handled separately: an unreadable text value alone does not prove editing, and expiry does not reread text or selection.
+
+When hit testing returns only the original window/application boundary, or parent traversal is incomplete, the relationship is unknown. Such a click does not trigger an early send. A blank-area click whose target cannot be distinguished from the original input therefore waits for another confirmed departure or expiry.
+
 Supporting the original behavior for these cases requires a separate routing design: intercepting and deferring transitions, or a supported element-level submission/focus mechanism. Neither is introduced implicitly in this change.
+
+Expiry relies on the latest foreground observations and notifications, then checks health and authorization without another AX read. A focus or content change whose notification has not yet arrived can fall between the last observation and actual event delivery. This change does not claim an atomic guarantee about native first-responder routing; that remains outside the unit-test evidence.
 
 ## Paste association and content alignment
 

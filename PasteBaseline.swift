@@ -5,6 +5,7 @@ import Foundation
 struct PasteBaseline {
     private struct Line {
         let text: String
+        let terminator: String
         let range: NSRange
     }
 
@@ -53,9 +54,15 @@ struct PasteBaseline {
             // Without surrounding text, only a surviving original paste can
             // identify the row; a completely rewritten row is unlocatable.
             let string = afterText as NSString
+            let target = Array(expectedLines[region]).map(\.text)
+            for start in matchingStarts(target, in: current) {
+                candidates.append(start...(start + target.count - 1))
+                guard candidates.count <= 128 else { return false }
+            }
+            let evidence = settlementEvidenceText(pastedText)
             var offset = 0
-            while offset < string.length {
-                let found = string.range(of: pastedText, options: [], range: NSRange(location: offset, length: string.length - offset))
+            while !evidence.isEmpty, offset < string.length {
+                let found = string.range(of: evidence, options: [], range: NSRange(location: offset, length: string.length - offset))
                 if found.location == NSNotFound { break }
                 if let candidate = lineRange(containing: found, in: current), !candidates.contains(candidate) {
                     candidates.append(candidate)
@@ -65,14 +72,13 @@ struct PasteBaseline {
             }
         }
 
-        let target = Array(expectedLines[region]).map(\.text)
         var bestCost = infinity
         var best: ClosedRange<Int>?
         var ambiguous = false
         for candidate in candidates {
             // Any plausible unchanged target keeps this a localization problem,
             // rather than proof that an edit occurred during settlement.
-            if Array(current[candidate]).map(\.text) == target { return false }
+            if protectedSequenceEqual(Array(expectedLines[region]), Array(current[candidate])) { return false }
             guard let prefixCost = distance(Array(expectedLines[..<region.lowerBound]), Array(current[..<candidate.lowerBound])),
                   let suffixCost = distance(Array(expectedLines[(region.upperBound + 1)...]), Array(current[(candidate.upperBound + 1)...])) else { return false }
             let cost = prefixCost + suffixCost
@@ -88,14 +94,17 @@ struct PasteBaseline {
     }
 
     private static func inferredSettlementInsertion(before: String, after: String, pasted: String) -> Int? {
+        if before.isEmpty { return 0 }
         let original = splitLines(before)
         let current = splitLines(after)
         let string = after as NSString
+        let evidence = settlementEvidenceText(pasted)
+        guard !evidence.isEmpty else { return nil }
         var offset = 0
         var locations = Set<Int>()
         var occurrences = 0
         while offset < string.length {
-            let found = string.range(of: pasted, options: [], range: NSRange(location: offset, length: string.length - offset))
+            let found = string.range(of: evidence, options: [], range: NSRange(location: offset, length: string.length - offset))
             if found.location == NSNotFound { break }
             occurrences += 1
             guard occurrences <= 128, let region = lineRange(containing: found, in: current) else { return nil }
@@ -117,11 +126,16 @@ struct PasteBaseline {
                     locations.insert(line.range.location + text.length - suffixLength)
                 }
             }
-            if before.isEmpty { locations.insert(0) }
             if locations.count > 1 { return nil }
             offset = found.location + 1
         }
         return locations.count == 1 ? locations.first : nil
+    }
+
+    private static func settlementEvidenceText(_ pasted: String) -> String {
+        let string = pasted as NSString
+        let lastTerminatorLength = splitLines(pasted).last.map { ($0.terminator as NSString).length } ?? 0
+        return string.substring(to: string.length - lastTerminatorLength)
     }
 
     init(beforeText: String?, insertionStart: Int?, insertionLength: Int = 0,
@@ -199,7 +213,7 @@ struct PasteBaseline {
             Self.advance(safe[0] + 1, unsafe[0] + 1, dangerous: protected,
                          safe: &nextSafe[0], unsafe: &nextUnsafe[0])
             for (column, candidate) in current.enumerated() {
-                let equal = original.text == candidate.text
+                let equal = protected ? protectedLineEqual(original, candidate) : original.text == candidate.text
                 // Replacing an external row costs a delete plus an insert. A
                 // cheap substitution must not obscure a unique surviving row.
                 Self.advance(safe[column] + (equal ? 0 : 2), unsafe[column] + (equal ? 0 : 2),
@@ -226,7 +240,8 @@ struct PasteBaseline {
         var result: ClosedRange<Int>?
         for start in matchingStarts(target, in: current) {
             let end = start + target.count
-            guard let prefixCost = distance(Array(original[..<region.lowerBound]), Array(current[..<start])),
+            guard protectedSequenceEqual(Array(original[region]), Array(current[start..<end])),
+                  let prefixCost = distance(Array(original[..<region.lowerBound]), Array(current[..<start])),
                   let suffixCost = distance(Array(original[(region.upperBound + 1)...]), Array(current[end...])),
                   prefixCost + suffixCost == cost else { continue }
             if result != nil { return nil }
@@ -253,13 +268,22 @@ struct PasteBaseline {
             var start = 0, end = 0, contentsEnd = 0
             string.getLineStart(&start, end: &end, contentsEnd: &contentsEnd,
                                 for: NSRange(location: offset, length: 0))
-            // A line terminator separates rows; appending an outside row must
-            // not look like an edit to the preceding row's actual text.
             result.append(Line(text: string.substring(with: NSRange(location: start, length: contentsEnd - start)),
+                               terminator: string.substring(with: NSRange(location: contentsEnd, length: end - contentsEnd)),
                                range: NSRange(location: start, length: end - start)))
             offset = end
         }
         return result
+    }
+
+    private static func protectedLineEqual(_ original: Line, _ current: Line) -> Bool {
+        // Preserve a separator that was already part of the protected region.
+        // An originally unterminated last row can gain an outside output row.
+        original.text == current.text && (original.terminator.isEmpty || original.terminator == current.terminator)
+    }
+
+    private static func protectedSequenceEqual(_ original: [Line], _ current: [Line]) -> Bool {
+        original.count == current.count && zip(original, current).allSatisfy { protectedLineEqual($0, $1) }
     }
 
     private static func lineRange(containing range: NSRange, in lines: [Line]) -> ClosedRange<Int>? {

@@ -192,6 +192,35 @@ print(String(data: try! JSONSerialization.data(withJSONObject: results), encodin
         self.check_settlement(**values, after="new header\nask: 你好\nworld\nnew footer", expected=False)
         self.check_settlement(**values, after="😀\nask: \nfooter", expected=True)
 
+    def test_existing_pasted_line_terminator_cannot_be_deleted_or_changed(self):
+        for newline in ("\n", "\r\n"):
+            for start in (None, 0):
+                with self.subTest(newline=newline, start=start):
+                    values = dict(before="", start=start, after="hello" + newline, pasted="hello" + newline)
+                    self.check(**values, current="hello", expected=False)
+                    other = "\r\n" if newline == "\n" else "\n"
+                    self.check(**values, current="hello" + other, expected=False)
+
+    def test_multiline_paste_preserves_each_original_line_terminator(self):
+        values = dict(before="head\n> ", start=7, after="head\n> first\nsecond\r\n", pasted="first\nsecond\r\n")
+        self.check(**values, current="head\n> first\nsecond", expected=False)
+        self.check(**values, current="head\n> first\r\nsecond\r\n", expected=False)
+        self.check(**values, current="new head\n> first\nsecond\r\nnew output", expected=True)
+
+    def test_settlement_detects_deleted_or_changed_pasted_line_terminator(self):
+        for newline in ("\n", "\r\n"):
+            for start in (None, 0):
+                with self.subTest(newline=newline, start=start):
+                    self.check_settlement(before="", start=start, after="hello", pasted="hello" + newline, expected=True)
+                    other = "\r\n" if newline == "\n" else "\n"
+                    self.check_settlement(before="", start=start, after="hello" + other, pasted="hello" + newline, expected=True)
+        for start in (None, 0):
+            values = dict(before="", start=start, pasted="first\nsecond\r\n")
+            self.check_settlement(**values, after="first\nsecond", expected=True)
+            self.check_settlement(**values, after="first\r\nsecond\r\n", expected=True)
+            self.check_settlement(**values, after="first\nsecond\r\n", expected=False)
+        self.check_settlement(before="draft ", after="draft hello", pasted="hello\n", expected=True)
+
 
 if __name__ == "__main__":
     unittest.main()

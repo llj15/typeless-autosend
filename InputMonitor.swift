@@ -31,6 +31,8 @@ struct FocusSnapshot {
 
 struct InputMonitorError: Error { let reason: String }
 
+struct InputObservationToken: Hashable { let observerID: UInt; let epoch: Int }
+
 enum InputTargetRelation: Equatable { case inside, outside, unknown }
 enum InputParentStep<Element> {
     case parent(Element)
@@ -118,10 +120,20 @@ final class InputMonitor {
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
     private var focusObserver: AXObserver?
+    private let publishedObserverID = Atomic<UInt>(0)
+    private let publishedAttemptEpoch = Atomic<Int>(0)
+    private let deferredContentLock = NSLock()
+    private var deferredContentNotifications: [InputObservationToken: Int] = [:]
+    var currentObservationToken: InputObservationToken? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard attemptActive else { return nil }
+        return InputObservationToken(observerID: publishedObserverID.load(ordering: .acquiring), epoch: attemptEpoch)
+    }
     private var simulatedOriginalFocus: FocusSnapshot?
     private var simulatedOriginalApplicationFocus: FocusSnapshot?
     private var simulatedFocus: FocusSnapshot
     private var focusReadable = true
+    private var identityReadable = true
     private var simulatedMonitoring = InputMonitoringState()
     private var simulatedEnableSucceeds = true
     private var simulatedCreateSucceeds = true
@@ -176,6 +188,7 @@ final class InputMonitor {
         manualTestSettlement = dryRun && environment["TYPELESS_TEST_MANUAL_SETTLE"] == "1"
         eventPath = dryRun ? environment["TYPELESS_TEST_EVENTS"] : nil
         simulatedFocus = FocusSnapshot(bundleID: environment["TYPELESS_FAKE_FRONT"] ?? "dry-run")
+        if dryRun { publishedObserverID.store(1, ordering: .releasing) }
         if dryRun, let pid = environment["TYPELESS_TEST_TYPELESS_PID"].flatMap(Int32.init) {
             verifiedTypelessPIDs = [pid]
         }
@@ -386,7 +399,7 @@ final class InputMonitor {
             for _ in 0..<maximumDepth {
                 if nodes.contains(where: { equal($0, current) }) { return (nodes, false) }
                 switch parentStep(current) {
-                case .boundary: return (nodes, true)
+                case .boundary: return (nodes + [current], true)
                 case .unavailable: return (nodes, false)
                 case .parent(let parent): nodes.append(current); current = parent
                 }
@@ -402,7 +415,10 @@ final class InputMonitor {
 
     private func classifyInputTarget(_ hit: AXUIElement, _ original: AXUIElement,
                                      deadline: TimeInterval) -> InputTargetRelation {
-        Self.classifyInputTarget(hit: hit, original: original, equal: { CFEqual($0, $1) }, parentStep: { element in
+        // An application-level hit can contain the original window even when
+        // the hit test omits every descendant. It never proves an outside click.
+        if attribute(hit, kAXRoleAttribute, deadline: deadline) as? String == kAXApplicationRole { return .unknown }
+        return Self.classifyInputTarget(hit: hit, original: original, equal: { CFEqual($0, $1) }, parentStep: { element in
             guard let role = self.attribute(element, kAXRoleAttribute, deadline: deadline) as? String else { return .unavailable }
             if [kAXWindowRole, kAXApplicationRole].contains(role) { return .boundary }
             guard let parent = self.attribute(element, kAXParentAttribute, deadline: deadline),
@@ -533,6 +549,7 @@ final class InputMonitor {
             return key
         }
         attemptEpoch += 1
+        publishedAttemptEpoch.store(attemptEpoch, ordering: .releasing)
         attemptActive = true
         armedFocus = focus
         if dryRun, focus.sameTarget(as: simulatedFocus) { simulatedOriginalFocus = simulatedFocus }
@@ -564,6 +581,7 @@ final class InputMonitor {
         sentOnEventThread = false
         returnEvents = []
         attemptEpoch += 1
+        publishedAttemptEpoch.store(attemptEpoch, ordering: .releasing)
         attemptActive = false
         armedFocus = nil
         consumedPaste = nil
@@ -573,6 +591,7 @@ final class InputMonitor {
             CFRunLoopRemoveSource(eventRunLoop, AXObserverGetRunLoopSource(focusObserver), .commonModes)
         }
         focusObserver = nil
+        if !dryRun { publishedObserverID.store(0, ordering: .releasing) }
         return outcome
     }
 
@@ -636,7 +655,7 @@ final class InputMonitor {
     // responder, so a confirmed focus change cannot safely send to the old one.
     private func inspectIdentity(_ target: FocusSnapshot, deadline: TimeInterval) -> Result<FocusSnapshot, InputMonitorError> {
         if dryRun {
-            guard focusReadable else { return .failure(InputMonitorError(reason: "cannot inspect caret/focus")) }
+            guard identityReadable else { return .failure(InputMonitorError(reason: "cannot inspect input identity")) }
             let current = originalIsFrontmost(target) ? simulatedFocus : (simulatedOriginalApplicationFocus ?? target)
             return .success(current)
         }
@@ -650,8 +669,11 @@ final class InputMonitor {
     }
 
     private func originalIdentityUnchanged(_ original: FocusSnapshot) -> Bool {
-        if case .success(let current) = inspectIdentity(original, deadline: ProcessInfo.processInfo.systemUptime + 0.025),
-           !original.sameTarget(as: current) {
+        guard case .success(let current) = inspectIdentity(original, deadline: ProcessInfo.processInfo.systemUptime + 0.025) else {
+            cancelFromEvent("cannot verify original input focus before delivery")
+            return false
+        }
+        if !original.sameTarget(as: current) {
             cancelFromEvent("original input focus changed before delivery")
             return false
         }
@@ -724,14 +746,19 @@ final class InputMonitor {
             return .failure(InputMonitorError(reason: "attempt already consumed, cancelled or input inspection interrupted"))
         }
         guard settled, originalIsFrontmost(original) else { return .success(original) }
-        let result = dryRun ? inspectFocus(simulatedFocus, deadline: .infinity)
-            : inspectFocus(original, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025)
-        // Only observed editing cancels. A transient AX read failure is not an edit.
-        guard case .success(let current) = result else { return .success(original) }
-        guard original.sameTarget(as: current) else {
+        guard case .success(let identity) = inspectIdentity(original, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025) else {
+            cancelFromEvent("cannot verify original input focus before delivery")
+            return .failure(InputMonitorError(reason: "cannot verify original input focus before delivery"))
+        }
+        guard original.sameTarget(as: identity) else {
             cancelFromEvent("original input focus changed before delivery")
             return .failure(InputMonitorError(reason: "original input focus changed before delivery"))
         }
+        let result = inspectInput(dryRun ? simulatedFocus : identity,
+            deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025)
+        // A text read may fail independently of the focused input's identity.
+        // Unknown text is not proof that the protected region was edited.
+        guard case .success(let current) = result else { return .success(original) }
         guard !contentWasEdited(current, baseline: original) else {
             cancelFromEvent("original content/caret/selection changed")
             return .failure(InputMonitorError(reason: "original content/caret/selection changed"))
@@ -749,19 +776,11 @@ final class InputMonitor {
         stateLock.lock()
         let epoch = attemptEpoch
         stateLock.unlock()
-        let operation = { [self] in
-            guard stateLock.try() else {
-                // This is a timer job, not a missed physical input. An old
-                // delivery must not invalidate a newly armed attempt.
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-            defer { stateLock.unlock() }
-            // The timer performs health/authorization checks only. All content
-            // and caret comparisons happen during foreground monitoring.
-            let safe = epoch == attemptEpoch && sendNow(reason: "original-pid", report: false)
-            DispatchQueue.main.async { completion(safe) }
-        }
+        scheduleDelivery(epoch: epoch, completion: completion)
+    }
+
+    private func scheduleDelivery(epoch: Int, completion: @escaping (Bool) -> Void) {
+        let operation = { [self] in performDelivery(epoch: epoch, completion: completion) }
         if dryRun { operation() }
         else if let eventRunLoop {
             CFRunLoopPerformBlock(eventRunLoop, CFRunLoopMode.commonModes.rawValue, operation)
@@ -769,30 +788,41 @@ final class InputMonitor {
         } else { completion(false) }
     }
 
+    private func performDelivery(epoch: Int, completion: @escaping (Bool) -> Void) {
+        guard stateLock.try() else {
+            // A timer losing the lock must not invalidate another attempt.
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+        defer { stateLock.unlock() }
+        let token = InputObservationToken(observerID: publishedObserverID.load(ordering: .acquiring), epoch: epoch)
+        deferredContentLock.lock()
+        let awaitingNotification = (deferredContentNotifications[token] ?? 0) > 0
+        deferredContentLock.unlock()
+        if epoch == attemptEpoch && awaitingNotification {
+            // The notification handler was queued before this block. Let that
+            // content comparison finish before retrying the timer; the timer
+            // itself never reads AX text or selection.
+            DispatchQueue.main.async { [self] in scheduleDelivery(epoch: epoch, completion: completion) }
+            return
+        }
+        let safe = epoch == attemptEpoch && sendNow(reason: "original-pid", report: false)
+        DispatchQueue.main.async { completion(safe) }
+    }
+
     private func observeFocus(pid: pid_t) -> Bool {
         if let focusObserver {
             CFRunLoopRemoveSource(eventRunLoop, AXObserverGetRunLoopSource(focusObserver), .commonModes)
         }
         focusObserver = nil
+        publishedObserverID.store(0, ordering: .releasing)
         var observer: AXObserver?
         guard AXObserverCreate(pid, { observer, element, notification, context in
             if let context {
                 let monitor = Unmanaged<InputMonitor>.fromOpaque(context).takeUnretainedValue()
-                guard monitor.stateLock.try() else {
-                    monitor.missedEvent.store(true, ordering: .releasing)
-                    return
-                }
-                defer { monitor.stateLock.unlock() }
-                guard let activeObserver = monitor.focusObserver, CFEqual(observer, activeObserver) else { return }
-                guard monitor.attemptActive, let original = monitor.armedFocus else { return }
-                if [kAXValueChangedNotification, kAXSelectedTextChangedNotification].contains(notification as String) {
-                    if monitor.settled { _ = monitor.validateAttempt() }
-                    return
-                }
-                var notified = original
-                if notification as String == kAXFocusedUIElementChangedNotification { notified.input = element }
-                else { notified.window = element }
-                monitor.handleFocusNotification(notified)
+                let token = InputObservationToken(observerID: UInt(bitPattern: Unmanaged.passUnretained(observer).toOpaque()),
+                    epoch: monitor.publishedAttemptEpoch.load(ordering: .acquiring))
+                monitor.handleAXNotification(notification as String, token: token, element: element)
             }
         }, &observer) == .success, let observer else { return false }
         let app = AXUIElementCreateApplication(pid)
@@ -802,8 +832,52 @@ final class InputMonitor {
             guard AXObserverAddNotification(observer, app, notification as CFString, context) == .success else { return false }
         }
         focusObserver = observer
+        publishedObserverID.store(UInt(bitPattern: Unmanaged.passUnretained(observer).toOpaque()), ordering: .releasing)
         CFRunLoopAddSource(eventRunLoop, AXObserverGetRunLoopSource(observer), .commonModes)
         return true
+    }
+
+    // Shared by the real AX callback and unit harness; the token binds callbacks
+    // to both the installed observer and the attempt that was active on arrival.
+    func handleAXNotification(_ notification: String, token: InputObservationToken, element: AXUIElement? = nil) {
+        guard token.epoch == publishedAttemptEpoch.load(ordering: .acquiring),
+              token.observerID == publishedObserverID.load(ordering: .acquiring) else { return }
+        guard stateLock.try() else {
+            if [kAXValueChangedNotification, kAXSelectedTextChangedNotification].contains(notification) {
+                // A notification is only a request to compare the protected
+                // region. Preserve its observer and epoch while deferring it.
+                deferredContentLock.lock()
+                deferredContentNotifications[token, default: 0] += 1
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.stateLock.lock(); defer { self.stateLock.unlock() }
+                    self.processAXNotification(notification, token: token, element: element)
+                    self.deferredContentLock.lock()
+                    if let count = self.deferredContentNotifications[token], count > 1 {
+                        self.deferredContentNotifications[token] = count - 1
+                    } else { self.deferredContentNotifications.removeValue(forKey: token) }
+                    self.deferredContentLock.unlock()
+                }
+                deferredContentLock.unlock()
+            } else { missedEvent.store(true, ordering: .releasing) }
+            return
+        }
+        defer { stateLock.unlock() }
+        processAXNotification(notification, token: token, element: element)
+    }
+
+    private func processAXNotification(_ notification: String, token: InputObservationToken, element: AXUIElement?) {
+        guard token.epoch == attemptEpoch, token.observerID == publishedObserverID.load(ordering: .acquiring),
+              attemptActive, let original = armedFocus else { return }
+        if [kAXValueChangedNotification, kAXSelectedTextChangedNotification].contains(notification) {
+            if settled { _ = validateAttempt() }
+            return
+        }
+        guard let element else { return }
+        var notified = original
+        if notification == kAXFocusedUIElementChangedNotification { notified.input = element }
+        else { notified.window = element }
+        handleFocusNotification(notified)
     }
 
     private func handleFocusNotification(_ notified: FocusSnapshot) {
@@ -873,6 +947,7 @@ final class InputMonitor {
             if type == "capability" {
                 if let value = json["inputMonitoring"] as? Bool { simulatedMonitoring.permissionGranted = value }
                 if let value = json["focusReadable"] as? Bool { focusReadable = value }
+                if let value = json["identityReadable"] as? Bool { identityReadable = value }
                 if let value = json["processAlive"] as? Bool {
                     simulatedProcessAlive = value
                     if !value { cancelFromEvent("original application exited") }

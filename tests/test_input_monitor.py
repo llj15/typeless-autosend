@@ -95,6 +95,67 @@ for (code, type, flags) in [(CGKeyCode(0), CGEventType.keyDown, CGEventFlags()),
     event(m, "state", ["text": "confirmed edit"])
     expect(!valid(m), "observed editing still cancels after key contention")
 }
+// The shared native AX handler must defer a content notification when an
+// unrelated AX/database operation holds stateLock. The notification itself is
+// never proof of a protected-region edit.
+for notification in [kAXValueChangedNotification, kAXSelectedTextChangedNotification] {
+    let m = make(); arm(m)
+    let token = m.currentObservationToken!
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "notification-record" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "AX notification worker holds state lock")
+    m.handleAXNotification(notification, token: token)
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "AX callback returns without blocking input thread")
+    expect(delivered(m), "contended redundant content notification still permits send")
+}
+// A deferred value notification must compare the latest protected region
+// before a timer can send; reverting afterwards never resurrects the attempt.
+do {
+    let m = make(); arm(m)
+    let token = m.currentObservationToken!
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "edited-notification-record" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "deferred edit worker holds lock")
+    m.handleAXNotification(kAXValueChangedNotification, token: token)
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "deferred edit callback never blocks")
+    event(m, "unnotified_state", ["text": "real protected edit"])
+    expect(!delivered(m), "deferred content comparison cancels real edit before timer sends")
+    event(m, "state", ["text": ""])
+    expect(!delivered(m), "deferred edit cancellation is permanent")
+}
+// Queued callbacks from the old observer/epoch cannot cancel a freshly armed
+// attempt. A stale focus payload would be dangerous if its token were ignored.
+do {
+    let m = make(); arm(m)
+    let oldToken = m.currentObservationToken!
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "old-observer-record" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "stale observer worker holds lock")
+    m.handleAXNotification(kAXSelectedTextChangedNotification, token: oldToken)
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "stale observer callback returns promptly")
+    _ = m.endAttempt()
+    event(m, "state", ["text": "new baseline"])
+    guard case .success(let f) = m.currentFocus() else { fatalError("new observer focus") }
+    m.armAttempt(focus: f, authorize: { true }); m.settleAttempt()
+    let newToken = m.currentObservationToken!
+    let staleObserver = InputObservationToken(observerID: oldToken.observerID + 1, epoch: newToken.epoch)
+    let staleElement = AXUIElementCreateApplication(0)
+    m.handleAXNotification(kAXFocusedUIElementChangedNotification, token: oldToken, element: staleElement)
+    m.handleAXNotification(kAXFocusedUIElementChangedNotification, token: staleObserver, element: staleElement)
+    expect(delivered(m), "old observer and old epoch cannot cancel a new attempt")
+}
 // A missed verified paste invalidates its cached target without poisoning
 // the current countdown. A later record cannot consume an older capture.
 do {
@@ -121,7 +182,7 @@ do {
 // parents, deadline failures, depth limits and cycles never prove an outside hit.
 let fakeParents = [1: 2, 2: 10, 3: 10, 4: 1]
 func fakeStep(_ node: Int) -> InputParentStep<Int> {
-    if node == 10 { return .boundary }
+    if node == 10 || node == 11 { return .boundary }
     if let parent = fakeParents[node] { return .parent(parent) }
     return .unavailable
 }
@@ -132,7 +193,8 @@ expect(relation(1) == .inside, "direct input hit is inside")
 expect(relation(4) == .inside, "input child hit is inside")
 expect(relation(2) == .inside, "editor ancestor hit is inside")
 expect(relation(3) == .outside, "separate window branch is outside")
-expect(relation(10) == .outside, "window-level blank area is outside")
+expect(relation(10) == .inside, "same-window hit may contain the input and never proves an outside click")
+expect(relation(11) == .outside, "different complete window branches prove an outside click")
 expect(relation(99) == .unknown, "missing AX parent or timeout remains unknown")
 expect(relation(4, depth: 1) == .unknown, "incomplete depth-limited ancestry remains unknown")
 let cycle = InputMonitor.classifyInputTarget(hit: 20, original: 1, equal: ==, parentStep: { node -> InputParentStep<Int> in
@@ -283,6 +345,27 @@ do {
     event(m, "unnotified_state", ["caret": 4])
     event(m, "deactivate")
     expect(!m.sentAwaitingReport, "departure cannot send an unobserved caret edit")
+}
+// Text can be temporarily unreadable while identity is still confirmed. A
+// routing-identity failure is different: leaving must fail closed permanently.
+do {
+    let m = make(); arm(m)
+    event(m, "capability", ["focusReadable": false, "identityReadable": true])
+    expect(valid(m), "unreadable text does not cancel confirmed original identity")
+    expect(delivered(m), "timer never re-reads unreadable content")
+}
+do {
+    let m = make(); arm(m)
+    event(m, "capability", ["identityReadable": false])
+    event(m, "deactivate")
+    expect(!m.sentAwaitingReport, "departure never sends when input routing identity is unknown")
+    event(m, "capability", ["identityReadable": true])
+    expect(!delivered(m), "unknown departure identity cancellation is permanent")
+}
+do {
+    let m = make(); arm(m)
+    event(m, "capability", ["identityReadable": false])
+    expect(!valid(m), "foreground identity inspection failure cancels")
 }
 // Buffering may finish the system paste, but may not absorb an intervening
 // user edit into snapshot B. The same protection works without caret metadata.
