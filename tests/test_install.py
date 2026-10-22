@@ -24,7 +24,21 @@ os.makedirs(STUBS)
 open(f"{STUBS}/swiftc", "w").write("""#!/bin/bash
 if [ "$1" = "--version" ]; then [ "${SBX_NO_SWIFTC:-0}" = 1 ] && exit 1; echo "stub swiftc"; exit 0; fi
 out=""; while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done
-printf '#!/bin/bash\\necho "stub binary $*"\\n' > "$out"; chmod +x "$out"
+cat > "$out" <<'BINARY'
+#!/bin/bash
+if [ "$1" = doctor ]; then
+  case "${SBX_DOCTOR:-permission}" in
+    healthy) echo 'All good'; exit 0 ;;
+    permission) echo '  ✗ Background service lacks Accessibility permission: System Settings'; exit 1 ;;
+    listen) echo '  ✗ Background service Input Monitoring is unavailable (listen_permission_denied). Check Accessibility'; exit 1 ;;
+    secure) echo '  ✗ Background service Input Monitoring is unavailable (secure_input). Finish secure input'; exit 1 ;;
+    other) echo '  ✗ Database unavailable'; exit 1 ;;
+    unknown) echo '  ✗ No current Input Monitoring status from the service'; exit 1 ;;
+  esac
+fi
+echo "stub binary $*"
+BINARY
+chmod +x "$out"
 """)
 open(f"{STUBS}/launchctl", "w").write("""#!/bin/bash
 echo "$*" >> "$SBX_LOG"
@@ -84,7 +98,7 @@ check("the old log is kept as autosend.log.1 and the new log starts fresh",
       open(f"{d}/autosend.log.1").read() == "old-log\n" and "started," in open(f"{d}/autosend.log").read())
 check("the binary is in place and nothing is left in .build",
       os.access(f"{d}/typeless-autosend", os.X_OK) and not os.path.exists(f"{d}/.build/typeless-autosend"))
-check("output is English", "==> Building" in r.stdout and "Next steps:" in r.stdout and not CJK.search(r.stdout + r.stderr))
+check("output is English", "==> Building" in r.stdout and "Useful commands:" in r.stdout and not CJK.search(r.stdout + r.stderr))
 check("installation opens only Accessibility settings",
       os.path.exists(f"{home}/open.log") and open(f"{home}/open.log").read().splitlines() == [
           "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
@@ -124,6 +138,23 @@ relocated = run("install.sh", home, moved)
 check("reinstall repairs owned stale command and service path", relocated.returncode == 0 and
       os.path.realpath(f"{home}/.local/bin/typeless-autosend") == f"{moved}/typeless-autosend",
       relocated.stderr[-200:])
+
+print("Permission guidance follows the self-check")
+for mode in ("healthy", "listen", "secure", "other", "unknown"):
+    home, d = sandbox(f"doctor-{mode}")
+    r = run("install.sh", home, d, SBX_DOCTOR=mode)
+    needs_permission = mode == "listen"
+    check(f"{mode}: only a permission failure opens settings and prints authorization steps",
+          r.returncode == 0 and
+          os.path.exists(f"{home}/open.log") == needs_permission and
+          ("Permission setup:" in r.stdout) == needs_permission and
+          ("Opening this page does not grant permission" in r.stdout) == needs_permission,
+          r.stdout + r.stderr if r.returncode else "")
+    if mode == "healthy":
+        check("healthy: keeps doctor success visible", "All good" in r.stdout)
+    elif not needs_permission:
+        check(f"{mode}: preserves diagnostic and asks to rerun doctor",
+              "  ✗ " in r.stdout and "Resolve the self-check issues above" in r.stdout)
 
 print("Failure paths")
 home, d = sandbox("settings-unavailable")

@@ -181,9 +181,9 @@ path.write_text(json.dumps(services))
         self.assertEqual((self.target / "BUILD_INFO").read_text(), "version=v1.0.0\n")
         self.assertTrue((self.target / "uninstall.sh").exists())
         self.assertTrue((self.target / "skill/SKILL.md").exists())
-        self.assertEqual((self.home / "open.log").read_text().splitlines(),
-                         ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
-        self.assertIn(f"launchctl kickstart -k gui/{os.getuid()}/{LABEL}", result.stdout)
+        self.assertFalse((self.home / "open.log").exists())
+        self.assertNotIn("Permission setup:", result.stdout)
+        self.assertNotIn("Opening this page does not grant permission", result.stdout)
         shutil.rmtree(self.bundle)
         smoke = subprocess.run([str(self.home / ".local/bin/typeless-autosend"), "-h"],
                                capture_output=True, text=True, check=True)

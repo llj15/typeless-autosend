@@ -287,28 +287,41 @@ FISH_BLOCK
 esac
 
 echo "==> Self-check"
-./typeless-autosend doctor || true
+doctor_status=0
+doctor_output="$(./typeless-autosend doctor)" || doctor_status=$?
+printf '%s\n' "$doctor_output"
 
-echo "==> Opening privacy settings"
-if ! open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' 2>/dev/null; then
-  echo "Could not open Accessibility settings. Use the manual path below." >&2
-fi
+# Doctor can fail for unrelated reasons (database, config, Secure Input, etc.).
+# Only its explicit permission failures call for opening Accessibility settings.
+if [ "$doctor_status" -ne 0 ] && printf '%s\n' "$doctor_output" | grep -Eq '^  ✗ Background service (lacks Accessibility permission:|Input Monitoring is unavailable \(listen_permission_denied\))'; then
+  echo "==> Opening privacy settings"
+  if ! open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' 2>/dev/null; then
+    echo "Could not open Accessibility settings. Use the manual path below." >&2
+  fi
 
-cat <<EOF
+  cat <<EOF
 
 Opening this page does not grant permission; enable Accessibility manually.
 
-Next steps:
-  1. Enable typeless-autosend in Accessibility:
+Permission setup:
+     Enable typeless-autosend in Accessibility:
      System Settings → Privacy & Security → Accessibility
      If the executable is missing or an entry is stale after an upgrade,
      remove the stale entry with −, then add this file with +:
      $DIR/typeless-autosend
      After granting permissions, restart the service to refresh its permission state:
      launchctl kickstart -k gui/$UID_NUM/$LABEL
-  2. Find installed applications: typeless-autosend apps search <name>
+EOF
+elif [ "$doctor_status" -ne 0 ]; then
+  echo "Resolve the self-check issues above, then run: typeless-autosend doctor"
+fi
+
+cat <<EOF
+
+Useful commands:
+  1. Find installed applications: typeless-autosend apps search <name>
      Enable one by Bundle ID: typeless-autosend apps add <bundle.id>
-  3. Configure the delay: typeless-autosend delay set 1
+  2. Configure the delay: typeless-autosend delay set 1
      Pause/resume: typeless-autosend service pause / service resume
-  4. Check: typeless-autosend service status / doctor. Log: $DIR/autosend.log
+  3. Check: typeless-autosend service status / doctor. Log: $DIR/autosend.log
 EOF
