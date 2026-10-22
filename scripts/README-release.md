@@ -19,8 +19,11 @@ preserves `config.json` unchanged. It links `~/.local/bin/typeless-autosend`, se
 up your shell PATH if needed, and registers the login service. You can delete the
 downloaded archive and extracted directory after installation.
 
-The installer opens Accessibility settings. Enable the installed executable shown
-in its output, then run the printed `launchctl kickstart` command. An upgrade may
+The installer runs `doctor` automatically. If it reports missing Accessibility
+or input-listening permission, the installer opens Accessibility settings and
+prints authorization steps. When checks pass, no permission setup is needed.
+For a permission failure, enable the installed executable shown in its output,
+then run the printed `launchctl kickstart` command. An upgrade may
 require removing a stale Accessibility entry and adding the new executable.
 Separate Input Monitoring permission is not required. The binary is ad-hoc signed;
 this release is not Developer ID signed or notarized. If macOS blocks a downloaded
