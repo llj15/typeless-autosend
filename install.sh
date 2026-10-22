@@ -250,6 +250,42 @@ PATH_BLOCK
     ;;
 esac
 
+# Enable completion in new interactive shells; keep one guarded block per profile.
+case "${SHELL:-/bin/zsh}" in
+  */zsh|*/bash)
+    if ! grep -Fq '# >>> typeless-autosend completion >>>' "$SHELL_PROFILE" 2>/dev/null; then
+      mkdir -p "$(dirname "$SHELL_PROFILE")"
+      cat >> "$SHELL_PROFILE" <<'COMPLETION_BLOCK'
+
+# >>> typeless-autosend completion >>>
+if [[ $- == *i* ]] && command -v typeless-autosend >/dev/null 2>&1; then
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    eval "$(typeless-autosend completion zsh)"
+  elif [ -n "${BASH_VERSION:-}" ]; then
+    eval "$(typeless-autosend completion bash)"
+  fi
+fi
+# <<< typeless-autosend completion <<<
+COMPLETION_BLOCK
+    fi
+    echo "Tab completion enabled in new terminals ($SHELL_PROFILE)."
+    ;;
+  */fish)
+    FISH_COMPLETION="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/typeless-autosend.fish"
+    # Do not replace a completion installed by the user or another package.
+    if [ ! -e "$FISH_COMPLETION" ] && [ ! -L "$FISH_COMPLETION" ]; then
+      mkdir -p "$(dirname "$FISH_COMPLETION")"
+      cat > "$FISH_COMPLETION" <<'FISH_BLOCK'
+# typeless-autosend managed completion loader
+if type -q typeless-autosend
+  typeless-autosend completion fish | source
+end
+FISH_BLOCK
+    fi
+    echo 'Tab completion is available in new fish sessions; ensure ~/.local/bin is on PATH.'
+    ;;
+esac
+
 echo "==> Self-check"
 ./typeless-autosend doctor || true
 

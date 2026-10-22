@@ -134,6 +134,42 @@ exit(runCLI(arguments: Array(CommandLine.arguments.dropFirst()), store: Settings
         self.result("delay", "reset")
         self.assertEqual(self.result("delay", "get")["delaySeconds"], 1)
 
+    def test_all_delays_cover_enabled_and_disabled_overrides_without_writing(self):
+        self.config.write_text(json.dumps({"apps": ["COM.Example.Inherited", "com.example.custom"],
+            "delaySeconds": 0.75, "appDelaySeconds": {"com.example.custom": 0, "com.example.disabled": 2}}))
+        before = self.config.read_bytes()
+        result = self.result("delay", "get", "--all")
+        self.assertEqual(result["scope"], "all")
+        self.assertEqual(result["globalDelaySeconds"], 0.75)
+        self.assertEqual(result["count"], 3)
+        apps = result["apps"]
+        self.assertEqual([app["bundleID"] for app in apps],
+                         ["com.example.custom", "com.example.disabled", "com.example.inherited"])
+        self.assertEqual([app["delaySeconds"] for app in apps], [0, 2, 0.75])
+        self.assertEqual([app["overrideSeconds"] for app in apps], [0, 2, None])
+        self.assertEqual([app["enabled"] for app in apps], [True, False, True])
+        table = self.command("delay", "get", "--all", "--format", "table")
+        self.assertEqual(table.returncode, 0, table.stderr)
+        self.assertIn("GLOBAL DELAY (s)\t0.75", table.stdout)
+        self.assertIn("com.example.disabled\tfalse\t2\t2", table.stdout)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse(Path(str(self.config) + ".lock").exists())
+
+    def test_all_delays_defaults_empty_and_validates_flag_combinations(self):
+        self.assertEqual(self.result("delay", "get", "--all"),
+                         {"scope": "all", "globalDelaySeconds": 1, "apps": [], "count": 0})
+        self.assertFalse(self.config.exists())
+        for args in [("delay", "get", "--all", "--all"), ("delay", "get", "--all", "--app", "com.example.chat"),
+                     ("delay", "set", "2", "--all"), ("delay", "reset", "--all"), ("apps", "list", "--all")]:
+            result = self.command(*args)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(json.loads(result.stderr)["error"], "invalid_arguments")
+            self.assertEqual(result.stdout, "")
+        self.assertFalse(self.config.exists())
+        self.assertIn("--all", self.command("delay", "get", "--help").stdout)
+        schema = self.result("schema", "delay", "get")
+        self.assertIn("--all", [flag["name"] for flag in schema["flags"]])
+
     def test_pause_and_resume_persist_across_cli_processes(self):
         self.result("service", "pause")
         self.assertTrue(self.result("service", "status")["paused"])

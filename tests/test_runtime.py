@@ -53,7 +53,9 @@ class Runtime(unittest.TestCase):
         self.addCleanup(self.output.close)
         self.process = subprocess.Popen([self.binary], env=environment, stdout=self.output,
                                         stderr=subprocess.STDOUT)
-        self.wait_for("baseline ready")
+        # A fresh copied executable can take several seconds to launch on macOS.
+        # Separate process readiness from the tight event/countdown assertions below.
+        self.wait_for("baseline ready", timeout=10)
 
     def service_status(self):
         result = subprocess.run([self.binary, "service", "status"],

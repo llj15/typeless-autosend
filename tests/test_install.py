@@ -100,10 +100,13 @@ check("installs globally callable link", os.path.islink(link_path) and os.path.r
 profile = f"{home}/.zshrc"
 profile_text = open(profile).read() if os.path.exists(profile) else ""
 check("adds marked PATH setup for zsh", "# >>> typeless-autosend PATH >>>" in profile_text)
+check("enables guarded zsh completion", "# >>> typeless-autosend completion >>>" in profile_text and
+      'typeless-autosend completion zsh' in profile_text and '[[ $- == *i* ]]' in profile_text)
 shell = subprocess.run(["/bin/zsh", "-c", 'source "$HOME/.zshrc"; command -v typeless-autosend'],
                        env=dict(os.environ, HOME=home, PATH="/usr/bin:/bin"), capture_output=True, text=True)
 check("new shell can find global command", shell.returncode == 0 and shell.stdout.strip() == link_path)
 again = run("install.sh", home, d, "--app", "com.example.three")
+check("completion setup is idempotent", open(profile).read().count("# >>> typeless-autosend completion >>>") == 1)
 check("PATH setup is idempotent", os.path.exists(profile) and open(profile).read().count("# >>> typeless-autosend PATH >>>") == 1)
 check("--app is ignored with a notice when config.json already exists",
       "left untouched" in again.stdout and json.load(open(f"{d}/config.json"))["apps"] == ["com.example.one", "com.example.two"])

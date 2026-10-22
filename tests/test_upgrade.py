@@ -63,10 +63,49 @@ path.write_text(json.dumps(services))
         self.bin.mkdir(parents=True)
 
     def run_script(self, script="install.sh", **extra):
-        return subprocess.run(["/bin/bash", script], cwd=self.directory,
-            env=dict(os.environ, HOME=str(self.home), SHELL="/bin/zsh",
-                     PATH=f"{self.stubs}:/usr/bin:/bin", **extra),
-            capture_output=True, text=True, timeout=20)
+        environment = dict(os.environ, HOME=str(self.home), SHELL="/bin/zsh",
+                           PATH=f"{self.stubs}:/usr/bin:/bin")
+        environment.update(extra)
+        return subprocess.run(["/bin/bash", script], cwd=self.directory, env=environment,
+                              capture_output=True, text=True, timeout=20)
+
+    def test_bash_completion_profile_is_preserved_and_idempotent(self):
+        profile = self.home / ".bash_profile"
+        profile.write_text("# user settings\n")
+        for _ in range(2):
+            result = self.run_script(SHELL="/bin/bash")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = profile.read_text()
+        self.assertTrue(text.startswith("# user settings\n"))
+        self.assertEqual(text.count("# >>> typeless-autosend completion >>>"), 1)
+        self.assertIn('typeless-autosend completion bash', text)
+        syntax = subprocess.run(["/bin/bash", "--posix", "-n", str(profile)], capture_output=True, text=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_zsh_completion_honors_zdotdir_even_when_path_already_exists(self):
+        dotdir = self.home / "shell config x[1]"
+        dotdir.mkdir()
+        profile = dotdir / ".zshrc"
+        profile.write_text("# user settings\n")
+        result = self.run_script(ZDOTDIR=str(dotdir), PATH=f"{self.bin}:{self.stubs}:/usr/bin:/bin")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = profile.read_text()
+        self.assertIn("typeless-autosend completion zsh", text)
+        self.assertNotIn("# >>> typeless-autosend PATH >>>", text)
+        syntax = subprocess.run(["/bin/zsh", "-n", str(profile)], capture_output=True, text=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_fish_completion_honors_xdg_and_preserves_existing_file(self):
+        config = self.home / "fish config x[1]"
+        completion = config / "fish/completions/typeless-autosend.fish"
+        for _ in range(2):
+            result = self.run_script(SHELL="/opt/homebrew/bin/fish", XDG_CONFIG_HOME=str(config))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(completion.read_text().count("typeless-autosend completion fish | source"), 1)
+        completion.write_text("# custom completion\n")
+        result = self.run_script(SHELL="/opt/homebrew/bin/fish", XDG_CONFIG_HOME=str(config))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(completion.read_text(), "# custom completion\n")
 
     def legacy_install(self):
         binary = self.directory / "typeless-autoenter"

@@ -6,11 +6,11 @@ A macOS command-line utility and login service for Apple Silicon (ARM). After Ty
 
 Requires **macOS 15 or later on Apple Silicon (ARM64)**, with Typeless installed, signed in, and history enabled. Swift, Xcode, Node.js and npm are not needed.
 
-Download the `typeless-autosend-v1.0.0-macos-arm64.tar.gz` asset from [GitHub Releases](https://github.com/llj15/typeless-autosend/releases/latest). Choose the binary archive, not GitHub's generated **Source code** archives. Access to this private repository is required to download it.
+Download the `typeless-autosend-v1.1.0-macos-arm64.tar.gz` asset from [GitHub Releases](https://github.com/llj15/typeless-autosend/releases/latest). Choose the binary archive, not GitHub's generated **Source code** archives.
 
 ```bash
-tar -xzf typeless-autosend-v1.0.0-macos-arm64.tar.gz
-cd typeless-autosend-v1.0.0-macos-arm64
+tar -xzf typeless-autosend-v1.1.0-macos-arm64.tar.gz
+cd typeless-autosend-v1.1.0-macos-arm64
 ./install.sh
 ```
 
@@ -53,6 +53,7 @@ Search includes installed applications that are not running. Results contain the
 
 ```bash
 typeless-autosend delay get
+typeless-autosend delay get --all
 typeless-autosend delay set 2
 typeless-autosend delay set 0.5 --app com.mitchellh.ghostty
 typeless-autosend delay get --app com.mitchellh.ghostty
@@ -137,7 +138,31 @@ Use the installed directory's `uninstall.sh` if it is elsewhere. Uninstall stops
 From a clean, committed checkout on macOS with Xcode Command Line Tools:
 
 ```bash
-scripts/build-release.sh v1.0.0
+scripts/build-release.sh v1.1.0
 ```
 
 This builds an optimized `arm64-apple-macosx15.0` binary, verifies its architecture and ad-hoc signature, checks CLI help, and writes the binary archive and `SHA256SUMS` to `dist/`. Only distribution files are included; personal configuration and runtime data are excluded. `BUILD_INFO` records the version and exact source commit. Publish the archive and its external checksum together.
+
+## Tab completion
+
+The installer enables completion for your login shell (zsh, bash or fish) in new
+terminals. Complete commands, flags, output formats and configured Bundle IDs;
+`apps add` also suggests installed apps. Fish users must have `~/.local/bin` on PATH.
+For an existing installation, rerun the installer when upgrading, or enable it in
+one session:
+
+```bash
+# zsh
+source <(typeless-autosend completion zsh)
+# bash (including macOS Bash 3.2)
+source <(typeless-autosend completion bash)
+# fish
+typeless-autosend completion fish | source
+```
+
+`delay get --all` lists `globalDelaySeconds` and a sorted `apps` array covering
+enabled apps and apps with overrides, including disabled ones. Each row has its
+effective `delaySeconds`, nullable `overrideSeconds` and `enabled` state. With no
+configured apps the array is empty. `--all` and `--app` are mutually exclusive.
+Use `--format table` for a readable delay table. Reading delays never changes
+configuration.

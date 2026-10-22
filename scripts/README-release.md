@@ -32,6 +32,7 @@ Open a new terminal, then start with help:
 typeless-autosend -h
 typeless-autosend apps search Codex
 typeless-autosend apps add com.openai.codex
+typeless-autosend delay get --all
 typeless-autosend delay set 1
 typeless-autosend service status
 ```
@@ -56,5 +57,11 @@ For the default installation:
 
 If upgrading an installation in another directory, use its `uninstall.sh` instead.
 The script stops the service, removes owned command links and LaunchAgents, and
-deletes `config.json`. The program directory and shared shell PATH block remain.
+deletes `config.json`. The program directory and guarded shell setup remain; completion loaders are inert when the command is absent.
 Remove its Accessibility entry manually if no longer needed.
+
+Tab completion for zsh, bash and fish is enabled by the installer for new terminals.
+For the current terminal, run `source <(typeless-autosend completion zsh)` (zsh),
+`source <(typeless-autosend completion bash)` (bash), or
+`typeless-autosend completion fish | source` (fish). Fish needs `~/.local/bin` on PATH.
+Use `delay get --all` to inspect global and app delays, including disabled overrides.
