@@ -189,16 +189,6 @@ func accessibilityTrusted(prompt: Bool = false) -> Bool {
     AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): prompt] as CFDictionary)
 }
 
-func pressEnter() {
-    let src = CGEventSource(stateID: .hidSystemState)
-    for down in [true, false] {
-        guard let ev = CGEvent(keyboardEventSource: src, virtualKey: 0x24, keyDown: down) else { continue }
-        // Clear leftover modifier flags such as Fn, otherwise fn+Return turns into keypad Enter.
-        ev.flags = []
-        ev.post(tap: .cghidEventTap)
-    }
-}
-
 // MARK: - Subcommands
 
 // includeAccessory: also list menu-bar and launcher apps (Raycast, Alfred, ...).
@@ -400,19 +390,38 @@ func recordSkip(_ id: String, _ reason: String) {
     writeRuntimeStatus()
 }
 
-func cancelPending(_ reason: String) {
-    guard enterPending, let id = pendingRowID else { return }
+func clearPendingState() {
     pendingGeneration += 1
     enterPending = false
     pendingRowID = nil
     pendingFocus = nil
     pendingCancellationRevisions = nil
-    inputMonitor.endAttempt()
-    recordSkip(id, reason)
+}
+
+func finishPendingSend() {
+    guard enterPending, let id = pendingRowID else { return }
+    let reason = inputMonitor.endAttempt()
+    clearPendingState()
+    if let reason { log("\(dryRun ? "would enter" : "enter") id=\(id) destination=\(reason)") }
+    else { recordSkip(id, "attempt cancelled before send reporting") }
+    writeRuntimeStatus()
+}
+
+func cancelPending(_ reason: String) {
+    guard enterPending, let id = pendingRowID else { return }
+    // Atomically disarm or consume the send result. The event thread cannot
+    // deliver an old timer between our decision and cancellation.
+    let sentReason = inputMonitor.endAttempt()
+    clearPendingState()
+    if let sentReason {
+        log("\(dryRun ? "would enter" : "enter") id=\(id) destination=\(sentReason)")
+        writeRuntimeStatus()
+    } else { recordSkip(id, reason) }
 }
 inputMonitor.onKeyboard = cancelPending
 inputMonitor.onFocusChange = cancelPending
 inputMonitor.onMonitoringChange = { log($0) }
+inputMonitor.onSent = { _ in finishPendingSend() }
 
 func process(_ rows: [Row]) {
     guard var known = seen else {
@@ -499,60 +508,35 @@ func process(_ rows: [Row]) {
         let cancellationRevision = settings.cancellationRevision
         let appCancellationRevision = settings.appCancellationRevisions[normalizeBundleID(front)] ?? 0
         pendingCancellationRevisions = (cancellationRevision, appCancellationRevision)
-        inputMonitor.armAttempt(focus: focus)
+        inputMonitor.armAttempt(focus: focus, authorize: {
+            guard case .success(let latest) = readConfig(), !latest.paused,
+                  Set(latest.apps.map(normalizeBundleID)).contains(normalizeBundleID(front)),
+                  latest.cancellationRevision == cancellationRevision,
+                  (latest.appCancellationRevisions[normalizeBundleID(front)] ?? 0) == appCancellationRevision else { return false }
+            return true
+        })
         pendingGeneration += 1
         let generation = pendingGeneration
         writeRuntimeStatus()
+        DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay) {
+            guard generation == pendingGeneration, enterPending else { return }
+            inputMonitor.settleAttempt()
+        }
         func deliverWhenSafe() {
             inputMonitor.poll()
-            inputMonitor.validateMouseSelection()
             guard generation == pendingGeneration, enterPending else { return }
-            guard inputMonitor.available else { cancelPending("input monitoring unavailable"); return }
-            if inputMonitor.mouseChecksPending > 0 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: deliverWhenSafe)
-                return
+            // A focus-event send may have consumed the attempt on the event thread
+            // while this main-loop callback was waiting for the lock.
+            if inputMonitor.sentAwaitingReport { return }
+            inputMonitor.deliver { sent in
+                guard generation == pendingGeneration, enterPending else { return }
+                if inputMonitor.sentAwaitingReport { finishPendingSend(); return }
+                guard sent else {
+                    cancelPending("original input changed, unavailable or sending no longer authorized")
+                    return
+                }
+                finishPendingSend()
             }
-            defer {
-                enterPending = false
-                pendingRowID = nil
-                pendingFocus = nil
-                pendingCancellationRevisions = nil
-                inputMonitor.endAttempt()
-                writeRuntimeStatus()
-            }
-            guard case .success(let current) = inputMonitor.currentFocus(), focus.sameTarget(as: current) else {
-                recordSkip(row.id, "window/input/application focus changed or unavailable")
-                return
-            }
-            guard case .success(let latest) = readConfig(), !latest.paused,
-                  Set(latest.apps.map(normalizeBundleID)).contains(normalizeBundleID(current.bundleID)) else {
-                recordSkip(row.id, "app removed, paused or config unavailable")
-                return
-            }
-            guard latest.cancellationRevision == cancellationRevision else {
-                recordSkip(row.id, "pause was requested during countdown")
-                return
-            }
-            guard (latest.appCancellationRevisions[normalizeBundleID(front)] ?? 0) == appCancellationRevision else {
-                recordSkip(row.id, "app was removed during countdown")
-                return
-            }
-            // Focus/config reads can take time. Recheck health without repairing
-            // immediately before posting, so a new observed outage cannot be hidden.
-            guard inputMonitor.available else {
-                recordSkip(row.id, "input monitoring unavailable before send")
-                return
-            }
-            if dryRun {
-                log("would enter id=\(row.id) mode=\(row.mode) len=\(row.textLen)")
-                return
-            }
-            guard AXIsProcessTrusted() else {
-                recordSkip(row.id, "accessibility not trusted")
-                return
-            }
-            pressEnter()
-            log("enter id=\(row.id) mode=\(row.mode) len=\(row.textLen)")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay + additionalDelay, execute: deliverWhenSafe)
     }
@@ -560,13 +544,11 @@ func process(_ rows: [Row]) {
 
 let timer = Timer(timeInterval: pollInterval, repeats: true) { _ in
     inputMonitor.poll()
-    inputMonitor.validateMouseSelection()
+    if enterPending, inputMonitor.sentAwaitingReport { finishPendingSend() }
     if enterPending, !inputMonitor.available { cancelPending("input monitoring unavailable") }
     if enterPending, let focus = pendingFocus {
-        switch inputMonitor.currentFocus() {
-        case .failure(let error): cancelPending(error.reason)
-        case .success(let current):
-            if !focus.sameTarget(as: current) { cancelPending("window/input/application focus changed") }
+        if !inputMonitor.sentAwaitingReport, case .failure(let error) = inputMonitor.validateAttempt() {
+            cancelPending(error.reason)
         }
         if case .success(let settings) = readConfig() {
             if settings.paused { cancelPending("autosend paused") }
