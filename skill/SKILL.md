@@ -17,6 +17,7 @@ description: Operate the Typeless AutoSend CLI on macOS Apple Silicon to configu
 
 ## Pitfalls and recovery
 
+- Use `typeless-autosend delay get --all` to inspect global and app delays together, including disabled overrides; do not combine it with `--app`.
 - App-specific delays override the global value. Actual waiting adds a fixed 150 ms paste buffer, even when the configured delay is zero.
 - Real keys, including Fn/modifiers, and focus/caret changes cancel pending sends permanently. Returning focus does not resume them. Canceled attempts and transcriptions completed during pauses or listener outages are not replayed.
 - Pause persists across restarts. Removing an app also removes its delay override.

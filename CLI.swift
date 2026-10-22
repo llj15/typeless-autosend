@@ -16,6 +16,11 @@ private struct CLIProblem: Error {
 
 func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunning: () -> Bool) -> Int32? {
     guard !rawArguments.isEmpty, rawArguments.first != "doctor", rawArguments.first != "list-apps" else { return nil }
+    if rawArguments.starts(with: ["completion", "candidates", "--"]) {
+        let candidates = completionCandidates(words: Array(rawArguments.dropFirst(3)), store: store)
+        FileHandle.standardOutput.write(Data(candidates.map { $0 + "\n" }.joined().utf8))
+        return 0
+    }
     var arguments = rawArguments
     let ifNotExists = arguments.contains("--if-not-exists")
     let ifExists = arguments.contains("--if-exists")
@@ -44,16 +49,27 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
             return 0
         }
         let command = Array(arguments.prefix(2))
-        var allowedFlags: Set<String> = ["--json", "--format"]
+        var allowedFlags: Set<String> = noun == "completion" ? [] : ["--json", "--format"]
         if command == ["apps", "add"] { allowedFlags.insert("--if-not-exists") }
         if command == ["apps", "remove"] { allowedFlags.insert("--if-exists") }
         if noun == "delay" { allowedFlags.insert("--app") }
-        if noun == "schema" { allowedFlags.insert("--all") }
+        if noun == "schema" || command == ["delay", "get"] { allowedFlags.insert("--all") }
         var flags = Set<String>()
         for flag in rawArguments where flag.hasPrefix("--") {
             guard allowedFlags.contains(flag), flags.insert(flag).inserted else {
                 throw CLIProblem(code: 2, type: "invalid_arguments", message: "Unsupported or repeated option \(flag)", suggestion: "Run typeless-autosend --help for supported options")
             }
+        }
+        let allDelays = command == ["delay", "get"] && arguments.contains("--all")
+        if allDelays {
+            guard appID == nil else {
+                throw CLIProblem(code: 2, type: "invalid_arguments", message: "--all and --app are mutually exclusive", suggestion: "Use delay get --all or delay get --app <bundle.id>")
+            }
+            arguments.removeAll { $0 == "--all" }
+        }
+        if arguments.count == 2, noun == "completion", let script = completionScript(shell: arguments[1]) {
+            FileHandle.standardOutput.write(Data(script.utf8))
+            return 0
         }
         func validateBundleID(_ id: String) throws {
             guard id.range(of: "^[a-z0-9-]+(?:\\.[a-z0-9-]+)+$", options: .regularExpression) != nil else {
@@ -110,7 +126,7 @@ func runCLI(arguments rawArguments: [String], store: SettingsStore, serviceRunni
         }
         if arguments == ["delay", "get"] {
             let settings = try store.read()
-            emit(delayResult(settings, appID: appID))
+            emit(allDelays ? allDelayResults(settings) : delayResult(settings, appID: appID))
             return 0
         }
         if arguments.count == 3, noun == "delay", arguments[1] == "set" {
@@ -212,17 +228,20 @@ private func cliCommandSchemas() -> [[String: Any]] {
         ("apps remove", "Remove an app and its delay override", [["name": "bundle-id", "type": "string", "required": true]], [["name": "--if-exists", "type": "boolean", "required": false, "default": false]], "apps remove com.apple.TextEdit --if-exists"),
         ("apps list", "List enabled apps with installed and running metadata", [], [], "apps list --json"),
         ("apps search", "Search all installed apps by name or Bundle ID; no query lists all", [["name": "query", "type": "string", "required": false]], [], "apps search TextEdit"),
-        ("delay get", "Read global or effective app delay in seconds", [], [app], "delay get --app com.apple.TextEdit"),
+        ("delay get", "Read global, effective app, or all configured delays (--all excludes --app)", [], [app, ["name": "--all", "type": "boolean", "required": false, "default": false, "description": "List global and enabled/overridden app delays; excludes --app"]], "delay get --all"),
         ("delay set", "Set delay within the supported scheduler range; fractional seconds allowed", [["name": "seconds", "type": "number", "required": true, "minimum": 0, "maximum": maximumDelaySeconds]], [app], "delay set 0.5 --app com.apple.TextEdit"),
         ("delay reset", "Restore global delay to 1 second or remove an app override", [], [app], "delay reset --app com.apple.TextEdit"),
         ("service pause", "Persistently pause automatic Enter", [], [], "service pause"),
         ("service resume", "Persistently resume automatic Enter", [], [], "service resume"),
         ("service status", "Read service state, pause state and last skip reason", [], [], "service status --json"),
+        ("completion zsh", "Print a zsh completion script (source the output)", [], [], "completion zsh"),
+        ("completion bash", "Print a bash completion script (source the output)", [], [], "completion bash"),
+        ("completion fish", "Print a fish completion script (source the output)", [], [], "completion fish"),
         ("doctor", "Run legacy installation and permission checks", [], [], "doctor"),
         ("list-apps", "List running apps (legacy command)", [], [["name": "--all", "type": "boolean", "required": false, "default": false]], "list-apps --all")
     ]
     return entries.map { name, description, arguments, flags, example in
-        ["name": name, "description": description, "arguments": arguments, "flags": (["doctor", "list-apps"].contains(name) ? [] : common) + flags, "examples": ["typeless-autosend " + example]]
+        ["name": name, "description": description, "arguments": arguments, "flags": (["doctor", "list-apps"].contains(name) ? [] : (name.hasPrefix("completion ") ? common.filter { $0["name"] as? String == "--help" } : common)) + flags, "examples": ["typeless-autosend " + example]]
     }
 }
 
@@ -239,7 +258,11 @@ private func cliHelp(path: [String]) throws -> String {
     for schema in schemas {
         lines.append("  \(schema["name"] as? String ?? ""): \(schema["description"] as? String ?? "")")
     }
-    lines += ["", "Options: --json | --format json|table (optional; TTY: table, pipe: json)", "         --help, -h; help <resource> <action>"]
+    if path.first == "completion" {
+        lines += ["", "Output: shell script on stdout; source it in the selected shell.", "Options: --help, -h; help completion <shell>"]
+    } else {
+        lines += ["", "Options: --json | --format json|table (optional; TTY: table, pipe: json)", "         --help, -h; help <resource> <action>"]
+    }
     if schemas.count == 1 {
         for argument in schemas[0]["arguments"] as? [[String: Any]] ?? [] {
             lines.append("Argument: \(argument["name"] as? String ?? "") (\((argument["required"] as? Bool ?? false) ? "required" : "optional"))")
@@ -255,7 +278,14 @@ private func cliHelp(path: [String]) throws -> String {
 private func cliOutput(_ object: [String: Any], format: String) {
     guard format == "table" else { cliJSON(object); return }
     var lines: [String] = []
-    if let apps = object["apps"] as? [[String: Any]] {
+    if object["scope"] as? String == "all", let delays = object["apps"] as? [[String: Any]] {
+        lines.append("GLOBAL DELAY (s)\t\(cliTableValue(object["globalDelaySeconds"]))")
+        lines.append("BUNDLE ID\tENABLED\tDELAY (s)\tOVERRIDE (s)")
+        for app in delays {
+            lines.append(["bundleID", "enabled", "delaySeconds", "overrideSeconds"].map { cliTableValue(app[$0]) }.joined(separator: "\t"))
+        }
+        lines.append("\(delays.count) app(s)")
+    } else if let apps = object["apps"] as? [[String: Any]] {
         lines.append("BUNDLE ID\tNAME\tRUNNING\tENABLED")
         for app in apps {
             lines.append(["bundleID", "name", "running", "enabled"].map { cliTableValue(app[$0]) }.joined(separator: "\t"))
@@ -280,4 +310,69 @@ private func delayResult(_ settings: AutosendSettings, appID: String?) -> [Strin
      "delaySeconds": appID.map { settings.effectiveDelay(for: $0) } ?? settings.delaySeconds,
      "globalDelaySeconds": settings.delaySeconds,
      "overrideSeconds": appID.flatMap { settings.appDelaySeconds[$0] } as Any? ?? NSNull()]
+}
+
+private func allDelayResults(_ settings: AutosendSettings) -> [String: Any] {
+    let enabled = Set(settings.apps.map(normalizeBundleID))
+    let ids = enabled.union(settings.appDelaySeconds.keys).sorted()
+    let apps = ids.map { id -> [String: Any] in
+        var result = delayResult(settings, appID: id)
+        result["enabled"] = enabled.contains(id)
+        return result
+    }
+    return ["scope": "all", "globalDelaySeconds": settings.delaySeconds, "apps": apps, "count": apps.count]
+}
+
+// Read-only, line-oriented protocol used only by generated shell completions.
+// The last word is the current prefix (including an empty word after a space).
+private func completionCandidates(words: [String], store: SettingsStore) -> [String] {
+    let prefix = words.last ?? ""
+    let previous = Array(words.dropLast())
+    var path: [String] = []
+    var used = Set<String>()
+    var valueFor: String?
+    for word in previous {
+        if valueFor != nil { valueFor = nil; continue }
+        if word.hasPrefix("-") {
+            used.insert(word)
+            if ["--app", "--format"].contains(word) { valueFor = word }
+        } else { path.append(word) }
+    }
+    func matching(_ values: [String]) -> [String] { Array(Set(values)).filter { $0.hasPrefix(prefix) }.sorted() }
+    func appIDs(installed: Bool = false) -> [String] {
+        let settings = try? store.read()
+        var ids = (settings?.apps ?? []).map(normalizeBundleID) + Array((settings?.appDelaySeconds ?? [:]).keys)
+        if installed { ids += installedApplications(matching: prefix).compactMap { $0["bundleID"] as? String } }
+        return ids
+    }
+    if valueFor == "--format" { return matching(["json", "table"]) }
+    if valueFor == "--app" { return matching(appIDs()) }
+    let help = path.first == "help" || path.first == "schema"
+    if help { path.removeFirst() }
+    let schemas = cliCommandSchemas()
+    let names = schemas.compactMap { $0["name"] as? String }.map { $0.split(separator: " ").map(String.init) }
+    var candidates: [String] = []
+    for name in names where name.count > path.count && Array(name.prefix(path.count)) == path {
+        candidates.append(name[path.count])
+    }
+    if path.isEmpty && !help { candidates += ["help", "schema", "--help", "-h"] }
+    if help {
+        if previous.first == "schema", path.isEmpty, !used.contains("--all") { candidates.append("--all") }
+        return matching(candidates)
+    }
+    let target = path.joined(separator: " ")
+    if let schema = schemas.first(where: { $0["name"] as? String == target }) {
+        for flag in schema["flags"] as? [[String: Any]] ?? [] {
+            if let name = flag["name"] as? String, !used.contains(name),
+               !(name == "--all" && used.contains("--app")), !(name == "--app" && used.contains("--all")) { candidates.append(name) }
+        }
+    }
+    if path == ["apps", "add"] { candidates += appIDs(installed: true) }
+    if path == ["apps", "remove"] { candidates += (try? store.read().apps.map(normalizeBundleID)) ?? [] }
+    if path == ["delay", "set"] { candidates += ["0", "0.5", "1", "2"] }
+    // Flags remain available after a positional argument, such as delay set 1.
+    if path.count == 3, let schema = schemas.first(where: { $0["name"] as? String == path.prefix(2).joined(separator: " ") }) {
+        candidates += (schema["flags"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }.filter { !used.contains($0) }
+    }
+    return matching(candidates)
 }
