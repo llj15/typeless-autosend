@@ -11,6 +11,7 @@ struct FocusSnapshot {
     var input: AXUIElement?
     var windowToken = "window-1"
     var inputToken = "input-1"
+    var selectionAvailable = true
     var selectionStart = 0
     var selectionLength = 0
     var text = ""
@@ -29,6 +30,13 @@ struct FocusSnapshot {
 }
 
 struct InputMonitorError: Error { let reason: String }
+
+enum InputTargetRelation: Equatable { case inside, outside, unknown }
+enum InputParentStep<Element> {
+    case parent(Element)
+    case boundary
+    case unavailable
+}
 
 private struct InputMonitoringState: Equatable {
     var permissionGranted = true
@@ -53,40 +61,48 @@ private func validSelectionRange(location: Int, length: Int) -> Bool {
     location >= 0 && length >= 0 && location != NSNotFound && length != NSNotFound
 }
 
-// These conservative policy decisions are shared by native input and the
-// dry-run boundary; simulated transitions cannot bypass the production policy.
-private enum TransitionDecision { case preserve, cancel, send }
-private func keyboardDecision(code: Int64, flags: CGEventFlags, repeated: Bool, role: String?, ascii: Bool) -> TransitionDecision {
-    if code == 48 && flags.contains(.maskCommand) { return .preserve }
-    guard code == 48, !repeated, flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift, .maskSecondaryFn]).isEmpty,
-          role == kAXTextFieldRole, ascii else { return .cancel }
-    return .send
-}
-private func mouseDecision(left: Bool, flags: CGEventFlags, role: String?, separate: Bool) -> TransitionDecision {
-    guard left, flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty,
-          role == kAXTextFieldRole || role == kAXTextAreaRole, separate else { return .cancel }
-    return .send
-}
-
 // The only simulated system boundary is enabled by TYPELESS_DRY_RUN. It never posts keys.
 final class InputMonitor {
     let dryRun: Bool
     private let eventPath: String?
     private let manualTestSettlement: Bool
+    private let requirePasteCapture: Bool
     private var eventOffset = 0
     // All attempt/tap state is shared with the dedicated event thread. Callbacks
     // consume the attempt synchronously; reporting to the main loop is asynchronous.
     private let stateLock = NSRecursiveLock()
-    // A busy main-loop AX read must never hold up a physical input event.
-    // Missing even one event invalidates the attempt before a later send.
+    // A busy AX read must never hold up a physical input event. Only a missed
+    // actionable mouse event or real monitoring gap invalidates an attempt.
     private let missedEvent = Atomic<Bool>(false)
-    private var verifiedTypelessPIDs: Set<pid_t> = []
+    private let missedPasteCapture = Atomic<Bool>(false)
+    // Source identity can be checked without acquiring the AX/state lock. This
+    // small lock protects only a cached set and never spans an AX/database read.
+    private let sourcePIDLock = NSLock()
+    private var sourcePIDs: Set<pid_t> = []
+    private var verifiedTypelessPIDs: Set<pid_t> {
+        get { sourcePIDLock.lock(); defer { sourcePIDLock.unlock() }; return sourcePIDs }
+        set { sourcePIDLock.lock(); defer { sourcePIDLock.unlock() }; sourcePIDs = newValue }
+    }
     private var nextSourceRefresh: TimeInterval = 0
     private let eventThreadReady = DispatchSemaphore(value: 0)
     private var eventThread: Thread?
     private var eventRunLoop: CFRunLoop?
     private var authorizeSend: (() -> Bool)?
     private var settled = false
+    private struct PasteCapture {
+        var focus: FocusSnapshot
+        var recordID: String?
+        var capturedAt: TimeInterval
+        var departed = false
+    }
+    private var pasteCapture: PasteCapture?
+    private var consumedPaste: PasteCapture?
+    private var pasteBaseline: PasteBaseline?
+    private var pastedText = ""
+    private var pendingDeparture: String?
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var simulatedProcessAlive = true
+    private var simulatedAccessibilityTrusted = true
     private var sentOnEventThread = false
     private var lastSendReason = "original-pid"
     var sentReason: String {
@@ -103,6 +119,7 @@ final class InputMonitor {
     private var tapSource: CFRunLoopSource?
     private var focusObserver: AXObserver?
     private var simulatedOriginalFocus: FocusSnapshot?
+    private var simulatedOriginalApplicationFocus: FocusSnapshot?
     private var simulatedFocus: FocusSnapshot
     private var focusReadable = true
     private var simulatedMonitoring = InputMonitoringState()
@@ -143,6 +160,11 @@ final class InputMonitor {
             "inputTapEnabled": state.tapEnabled, "inputMonitoringRecoveryAttempts": recoveryAttempts,
             "inputMonitoringRecoveredAt": recoveredAfter.map { ISO8601DateFormatter.string(from: $0, timeZone: .current, formatOptions: [.withInternetDateTime, .withFractionalSeconds]) } as Any? ?? NSNull()]
     }
+    private var recordIDProvider: (() -> String?)?
+    var pasteRecordIDProvider: (() -> String?)? {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return recordIDProvider }
+        set { stateLock.lock(); defer { stateLock.unlock() }; recordIDProvider = newValue }
+    }
     var onSent: ((String) -> Void)?
     var onKeyboard: ((String) -> Void)?
     var onFocusChange: ((String) -> Void)?
@@ -150,9 +172,13 @@ final class InputMonitor {
 
     init(dryRun: Bool, environment: [String: String]) {
         self.dryRun = dryRun
+        requirePasteCapture = !dryRun || environment["TYPELESS_TEST_REQUIRE_PASTE"] == "1"
         manualTestSettlement = dryRun && environment["TYPELESS_TEST_MANUAL_SETTLE"] == "1"
         eventPath = dryRun ? environment["TYPELESS_TEST_EVENTS"] : nil
         simulatedFocus = FocusSnapshot(bundleID: environment["TYPELESS_FAKE_FRONT"] ?? "dry-run")
+        if dryRun, let pid = environment["TYPELESS_TEST_TYPELESS_PID"].flatMap(Int32.init) {
+            verifiedTypelessPIDs = [pid]
+        }
         if !dryRun {
             eventThread = Thread { [weak self] in
                 guard let self else { return }
@@ -167,7 +193,19 @@ final class InputMonitor {
             eventThread?.qualityOfService = .userInteractive
             eventThread?.start()
             eventThreadReady.wait()
+            refreshTypelessSources()
             installTap()
+            let center = NSWorkspace.shared.notificationCenter
+            workspaceObservers.append(center.addObserver(forName: NSWorkspace.didDeactivateApplicationNotification,
+                object: nil, queue: nil) { [weak self] notification in
+                guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                self?.applicationDeactivated(pid: application.processIdentifier)
+            })
+            workspaceObservers.append(center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification,
+                object: nil, queue: nil) { [weak self] notification in
+                guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                self?.applicationTerminated(pid: application.processIdentifier)
+            })
         }
     }
 
@@ -187,9 +225,9 @@ final class InputMonitor {
         }
         let context = Unmanaged.passUnretained(self).toOpaque()
         tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-            options: .defaultTap, eventsOfInterest: mask, callback: { proxy, type, event, context in
+            options: .defaultTap, eventsOfInterest: mask, callback: { _, type, event, context in
                 if let context {
-                    Unmanaged<InputMonitor>.fromOpaque(context).takeUnretainedValue().handle(proxy, type, event)
+                    Unmanaged<InputMonitor>.fromOpaque(context).takeUnretainedValue().handleEvent(type, event)
                 }
                 return Unmanaged.passUnretained(event)
             }, userInfo: context)
@@ -219,6 +257,8 @@ final class InputMonitor {
     private func recoverMonitoringIfNeeded() {
         let state = monitoringState
         if observedMonitoringGap {
+            cancelFromEvent("input monitoring unavailable")
+            pasteCapture = nil
             onKeyboard?("input monitoring unavailable: \(state.unavailableReason ?? "interruption observed")")
         }
         reportMonitoringState()
@@ -269,129 +309,193 @@ final class InputMonitor {
         }
     }
 
-    private func handle(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event: CGEvent) {
-        // Own keys cannot invalidate a later attempt even if main holds the lock.
+    func handleEvent(_ type: CGEventType, _ event: CGEvent) {
         if event.getIntegerValueField(.eventSourceUserData) == Self.eventMarker { return }
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.025
+        let keyboard = [.keyDown, .keyUp, .flagsChanged].contains(type)
+        let pasteChord = type == .keyDown &&
+            event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_ANSI_V) && event.flags.contains(.maskCommand)
+        // Ordinary keys carry no policy decision, so they never contend with a
+        // main-thread AX read. Source verification matters only for paste capture.
+        if keyboard && !pasteChord { return }
+        let typeless = verifiedTypelessPIDs.contains(pid_t(event.getIntegerValueField(.eventSourceUnixProcessID)))
+        let typelessPaste = pasteChord && typeless
+        if keyboard && !typelessPaste { return }
+        let interrupted = type == .tapDisabledByTimeout || type == .tapDisabledByUserInput
+        let mouseDown = [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type)
+        guard typelessPaste || interrupted || mouseDown else { return }
         guard stateLock.try() else {
-            missedEvent.store(true, ordering: .releasing)
+            if typelessPaste { missedPasteCapture.store(true, ordering: .releasing) }
+            else { missedEvent.store(true, ordering: .releasing) }
             return
         }
         defer { stateLock.unlock() }
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        if interrupted {
             observedMonitoringGap = true
+            pasteCapture = nil
             cancelFromEvent("input monitoring interrupted")
             return
         }
-        guard attemptActive, let original = armedFocus,
-              event.getIntegerValueField(.eventSourceUserData) != Self.eventMarker else { return }
-        if missedEvent.load(ordering: .acquiring) { cancelFromEvent("input event arrived during state inspection"); return }
-        // Querying the receiving application's AX focus is necessary: cached
-        // geometry alone cannot prove that focus has not changed in the meantime.
-        let isMouse = [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type)
-        if [.leftMouseUp, .rightMouseUp, .otherMouseUp].contains(type) { return }
-        if verifiedTypelessPIDs.contains(pid_t(event.getIntegerValueField(.eventSourceUnixProcessID))) { return }
-        if isMouse {
-            let system = AXUIElementCreateSystemWide()
-            AXUIElementSetMessagingTimeout(system, 0.005)
-            var hit: AXUIElement?
-            guard AXUIElementCopyElementAtPosition(system, Float(event.location.x), Float(event.location.y), &hit) == .success,
-                  let hit else { cancelFromEvent("cannot classify mouse target"); return }
-            var pid: pid_t = 0
-            guard AXUIElementGetPid(hit, &pid) == .success else { cancelFromEvent("cannot identify mouse application"); return }
-            // External clicks must leave the original countdown intact.
-            guard pid == original.processID else { return }
-            // A click activating the original background app is an application
-            // switch, not a same-application transition. Preserve its deadline.
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == original.processID else { return }
-            let role = attribute(hit, kAXRoleAttribute, deadline: deadline) as? String
-            let separate = original.input.map { !CFEqual(hit, $0) && separateEditableTarget(hit, from: $0, deadline: deadline) } ?? false
-            guard mouseDecision(left: type == .leftMouseDown, flags: event.flags, role: role, separate: separate) == .send else {
-                cancelFromEvent("mouse editing or uncertain focus transition"); return
-            }
-        } else {
-            if type == .flagsChanged, event.flags.contains(.maskSecondaryFn) {
-                cancelFromEvent("Fn activity (new dictation)"); return
-            }
-            let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-            guard frontPID == original.processID else { return }
-            let code = event.getIntegerValueField(.keyboardEventKeycode)
-            if type == .flagsChanged { return }
-            if type == .keyUp { return }
-            // Command-Tab changes application; modifiers alone do not edit text.
-            let role = code == 48 ? original.input.flatMap { attribute($0, kAXRoleAttribute, deadline: deadline) as? String } : nil
-            let decision = keyboardDecision(code: code, flags: event.flags,
-                repeated: event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
-                role: role, ascii: code == 48 && asciiInputSource())
-            if decision == .preserve { return }
-            guard type == .keyDown, decision == .send else {
-                cancelFromEvent("keyboard editing or uncertain focus transition"); return
-            }
+        // Capture before the event is released, even when the database has not
+        // announced a completed transcript yet. Only verified sources qualify.
+        if typelessPaste { capturePaste(); return }
+        if typeless { return }
+        let original: FocusSnapshot
+        if attemptActive, let armedFocus { original = armedFocus }
+        else if let capture = pasteCapture { original = capture.focus }
+        else { return }
+        if missedEvent.load(ordering: .acquiring) {
+            if attemptActive { cancelFromEvent("input event arrived during state inspection") }
+            return
         }
-        sendBeforeTransition(proxy: proxy, deadline: deadline)
+        guard mouseDown, originalIsFrontmost(original) else { return }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.025
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.005)
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(event.location.x), Float(event.location.y), &hit) == .success,
+              let hit else { return } // Deactivation handles clicks into another application.
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(hit, &pid) == .success, pid == original.processID else { return }
+        let relation = original.input.map { classifyInputTarget(hit, $0, deadline: deadline) } ?? .unknown
+        handleMouseTarget(relation, hitPID: pid)
     }
 
-    private func separateEditableTarget(_ hit: AXUIElement, from original: AXUIElement, deadline: TimeInterval) -> Bool {
-        // Prove that both leaves belong to distinct branches of an AX window.
-        // Composite editors can expose several AX objects for the same editor.
-        func ancestry(_ leaf: AXUIElement) -> [AXUIElement]? {
-            var result = [leaf]
+    // Shared by native hit testing and the pure dry-run boundary. A click may
+    // leave after paste capture but before the completed database row arms it.
+    func handleMouseTarget(_ relation: InputTargetRelation, hitPID: pid_t) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        let original = attemptActive ? armedFocus : pasteCapture?.focus
+        guard relation == .outside, let original, hitPID == original.processID,
+              originalIsFrontmost(original) else { return }
+        if attemptActive {
+            if settled, case .failure = validateAttempt() { return }
+            requestDeparture("before-focus-change")
+        } else { pasteCapture?.departed = true }
+    }
+
+    // Only a completed ancestry walk can prove that two objects are outside
+    // one another. Missing parents, timeouts, cycles and excessive depth leave
+    // classification unknown; focus/deactivation notifications remain active.
+    static func classifyInputTarget<Element>(hit: Element, original: Element,
+            equal: (Element, Element) -> Bool, parentStep: (Element) -> InputParentStep<Element>,
+            maximumDepth: Int = 24) -> InputTargetRelation {
+        if equal(hit, original) { return .inside }
+        func ancestry(_ leaf: Element) -> ([Element], Bool) {
+            var nodes: [Element] = []
             var current = leaf
-            for _ in 0..<12 {
-                guard let role = attribute(current, kAXRoleAttribute, deadline: deadline) as? String else { return nil }
-                if role == kAXWindowRole { return result }
-                if result.count > 1, [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role) { return nil }
-                guard let parent = attribute(current, kAXParentAttribute, deadline: deadline), CFGetTypeID(parent) == AXUIElementGetTypeID() else { return nil }
-                current = parent as! AXUIElement
-                if result.contains(where: { CFEqual($0, current) }) { return nil }
-                result.append(current)
+            for _ in 0..<maximumDepth {
+                if nodes.contains(where: { equal($0, current) }) { return (nodes, false) }
+                switch parentStep(current) {
+                case .boundary: return (nodes, true)
+                case .unavailable: return (nodes, false)
+                case .parent(let parent): nodes.append(current); current = parent
+                }
             }
-            return nil
+            return (nodes, false)
         }
-        guard attribute(hit, kAXEnabledAttribute, deadline: deadline) as? Bool == true,
-              let hitPath = ancestry(hit), let originalPath = ancestry(original),
-              !hitPath.contains(where: { CFEqual($0, original) }),
-              !originalPath.contains(where: { CFEqual($0, hit) }) else { return false }
-        var focusSettable = DarwinBoolean(false)
-        AXUIElementSetMessagingTimeout(hit, 0.005)
-        guard ProcessInfo.processInfo.systemUptime < deadline,
-              AXUIElementIsAttributeSettable(hit, kAXFocusedAttribute as CFString, &focusSettable) == .success,
-              focusSettable.boolValue else { return false }
-        return ProcessInfo.processInfo.systemUptime < deadline
+        let hitPath = ancestry(hit)
+        if hitPath.0.contains(where: { equal($0, original) }) { return .inside }
+        let originalPath = ancestry(original)
+        if originalPath.0.contains(where: { equal($0, hit) }) { return .inside }
+        return hitPath.1 && originalPath.1 ? .outside : .unknown
     }
 
-    private func sendBeforeTransition(proxy: CGEventTapProxy?, deadline: TimeInterval) {
-        guard settled, authorizeSend?() == true,
-              ProcessInfo.processInfo.systemUptime < deadline,
-              case .success = validateAttempt(deadline: deadline),
-              available, dryRun || AXIsProcessTrusted(), returnEvents.count == 2,
-              !missedEvent.load(ordering: .acquiring),
-              dryRun || NSWorkspace.shared.frontmostApplication?.processIdentifier == armedFocus?.processID,
-              ProcessInfo.processInfo.systemUptime < deadline else {
-            cancelFromEvent("cannot verify original input before focus transition"); return
+    private func classifyInputTarget(_ hit: AXUIElement, _ original: AXUIElement,
+                                     deadline: TimeInterval) -> InputTargetRelation {
+        Self.classifyInputTarget(hit: hit, original: original, equal: { CFEqual($0, $1) }, parentStep: { element in
+            guard let role = self.attribute(element, kAXRoleAttribute, deadline: deadline) as? String else { return .unavailable }
+            if [kAXWindowRole, kAXApplicationRole].contains(role) { return .boundary }
+            guard let parent = self.attribute(element, kAXParentAttribute, deadline: deadline),
+                  CFGetTypeID(parent) == AXUIElementGetTypeID() else { return .unavailable }
+            return .parent(parent as! AXUIElement)
+        })
+    }
+
+    private func capturePaste() {
+        missedPasteCapture.store(false, ordering: .releasing)
+        pasteCapture = nil
+        guard available, case .success(let snapshot) = currentFocus() else { return }
+        pasteCapture = PasteCapture(focus: snapshot, recordID: pasteRecordIDProvider?(), capturedAt: ProcessInfo.processInfo.systemUptime)
+    }
+
+    private func originalIsFrontmost(_ original: FocusSnapshot) -> Bool {
+        if dryRun { return normalizeBundleID(simulatedFocus.bundleID) == normalizeBundleID(original.bundleID) }
+        return NSWorkspace.shared.frontmostApplication?.processIdentifier == original.processID
+    }
+
+    private func applicationDeactivated(pid: pid_t) {
+        guard stateLock.try() else { missedEvent.store(true, ordering: .releasing); return }
+        defer { stateLock.unlock() }
+        if pasteCapture?.focus.processID == pid { pasteCapture?.departed = true }
+        guard armedFocus?.processID == pid else { return }
+        requestDeparture("original-pid")
+    }
+
+    private func applicationTerminated(pid: pid_t) {
+        guard stateLock.try() else { missedEvent.store(true, ordering: .releasing); return }
+        defer { stateLock.unlock() }
+        if pasteCapture?.focus.processID == pid { pasteCapture = nil }
+        if armedFocus?.processID == pid { cancelFromEvent("original application exited") }
+    }
+
+    private func requestDeparture(_ reason: String) {
+        guard attemptActive else { return }
+        guard settled else { pendingDeparture = reason; return }
+        // An edit can precede its queued AX notification or foreground poll.
+        // Take one final snapshot of the captured input object at departure;
+        // subsequent background activity is never polled for content changes.
+        if let original = armedFocus {
+            guard originalIdentityUnchanged(original) else { return }
+            let target = dryRun ? (simulatedOriginalFocus ?? original) : original
+            if case .success(let current) = inspectInput(target, deadline: ProcessInfo.processInfo.systemUptime + 0.025),
+               contentWasEdited(current, baseline: original) {
+                cancelFromEvent("original content/caret/selection changed")
+                return
+            }
+        }
+        _ = sendNow(reason: reason)
+    }
+
+    private func healthyForSend() -> Bool {
+        guard attemptActive, available, !observedMonitoringGap,
+              !missedEvent.load(ordering: .acquiring), let original = armedFocus else { return false }
+        if dryRun { return simulatedProcessAlive && simulatedAccessibilityTrusted }
+        return AXIsProcessTrusted() && NSRunningApplication(processIdentifier: original.processID)?.isTerminated == false
+    }
+
+    @discardableResult
+    private func sendNow(reason: String, report: Bool = true) -> Bool {
+        guard settled, healthyForSend(), authorizeSend?() == true, healthyForSend(), returnEvents.count == 2,
+              let original = armedFocus else {
+            cancelFromEvent("original application or send authorization unavailable")
+            return false
         }
         attemptActive = false
         sentOnEventThread = true
-        lastSendReason = "before-focus-change"
-        if let proxy, !dryRun { for key in returnEvents { key.tapPostEvent(proxy) } }
-        if dryRun { onSent?("before-focus-change"); return }
-        let epoch = attemptEpoch
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.stateLock.lock(); defer { self.stateLock.unlock() }
-            guard self.attemptEpoch == epoch else { return }
-            self.onSent?("before-focus-change")
+        lastSendReason = reason
+        if !dryRun {
+            for key in returnEvents {
+                key.postToPid(original.processID)
+            }
         }
-    }
-
-    private func asciiInputSource() -> Bool {
-        guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-              let property = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsASCIICapable) else { return false }
-        return CFBooleanGetValue(Unmanaged<CFBoolean>.fromOpaque(property).takeUnretainedValue())
+        guard report else { return true }
+        if dryRun { onSent?(reason) }
+        else {
+            let epoch = attemptEpoch
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock(); defer { self.stateLock.unlock() }
+                guard self.attemptEpoch == epoch else { return }
+                self.onSent?(reason)
+            }
+        }
+        return true
     }
 
     private func monitoringInterrupted(_ reason: String) {
         observedMonitoringGap = true
+        pasteCapture = nil
+        cancelFromEvent("input monitoring interrupted")
         onMonitoringChange?("input monitoring interrupted reason=\(reason)")
         onKeyboard?("input monitoring interrupted: \(reason)")
     }
@@ -411,14 +515,18 @@ final class InputMonitor {
         })
     }
 
-    func armAttempt(focus: FocusSnapshot, authorize: @escaping () -> Bool) {
+    func armAttempt(focus: FocusSnapshot, pastedText: String = "", authorize: @escaping () -> Bool) {
         stateLock.lock(); defer { stateLock.unlock() }
         authorizeSend = authorize
+        self.pastedText = pastedText
+        pasteBaseline = nil
+        pendingDeparture = consumedPaste?.departed == true ? "original-pid" : nil
+        if !originalIsFrontmost(focus) { pendingDeparture = "original-pid" }
         missedEvent.store(false, ordering: .releasing)
         settled = false
         sentOnEventThread = false
         returnEvents = [true, false].compactMap { down in
-            guard let key = CGEvent(keyboardEventSource: CGEventSource(stateID: .privateState), virtualKey: 0x24, keyDown: down) else { return nil }
+            guard let key = CGEvent(keyboardEventSource: CGEventSource(stateID: .privateState), virtualKey: CGKeyCode(kVK_Return), keyDown: down) else { return nil }
             key.flags = []
             key.setIntegerValueField(.eventSourceUserData, value: Self.eventMarker)
             key.setIntegerValueField(.eventTargetUnixProcessID, value: Int64(focus.processID))
@@ -427,14 +535,22 @@ final class InputMonitor {
         attemptEpoch += 1
         attemptActive = true
         armedFocus = focus
-        simulatedOriginalFocus = focus
+        if dryRun, focus.sameTarget(as: simulatedFocus) { simulatedOriginalFocus = simulatedFocus }
+        else if simulatedOriginalFocus?.sameTarget(as: focus) != true { simulatedOriginalFocus = focus }
+        if dryRun, originalIsFrontmost(focus) { simulatedOriginalApplicationFocus = simulatedFocus }
         if !dryRun, let observer = focusObserver, let input = focus.input {
             let context = Unmanaged.passUnretained(self).toOpaque()
-            for notification in [kAXValueChangedNotification, kAXSelectedTextChangedNotification] {
-                guard AXObserverAddNotification(observer, input, notification as CFString, context) == .success else {
-                    cancelFromEvent("content/selection notifications unavailable"); return
-                }
+            Self.registerContentNotifications { notification in
+                AXObserverAddNotification(observer, input, notification as CFString, context)
             }
+        }
+    }
+
+    // AX notification support varies independently of usable text/selection
+    // attributes. Registration is best effort; foreground polling is the backup.
+    static func registerContentNotifications(_ register: (String) -> AXError) {
+        for notification in [kAXValueChangedNotification, kAXSelectedTextChangedNotification] {
+            _ = register(notification)
         }
     }
 
@@ -450,6 +566,9 @@ final class InputMonitor {
         attemptEpoch += 1
         attemptActive = false
         armedFocus = nil
+        consumedPaste = nil
+        pasteBaseline = nil
+        pendingDeparture = nil
         if let focusObserver {
             CFRunLoopRemoveSource(eventRunLoop, AXObserverGetRunLoopSource(focusObserver), .commonModes)
         }
@@ -457,11 +576,22 @@ final class InputMonitor {
         return outcome
     }
 
-    func beginAttempt() -> Result<FocusSnapshot, InputMonitorError> {
+    func beginAttempt(recordID: String? = nil) -> Result<FocusSnapshot, InputMonitorError> {
         stateLock.lock(); defer { stateLock.unlock() }
         recoverMonitoringIfNeeded()
         guard available else { return .failure(InputMonitorError(reason: "input monitoring unavailable: \(monitoringState.unavailableReason ?? "unknown")")) }
-        let result = currentFocus()
+        let result: Result<FocusSnapshot, InputMonitorError>
+        if missedPasteCapture.exchange(false, ordering: .acquiringAndReleasing) { pasteCapture = nil }
+        if let capture = pasteCapture, ProcessInfo.processInfo.systemUptime - capture.capturedAt > 10 { pasteCapture = nil }
+        if let capture = pasteCapture, pasteRecordIDProvider == nil || (recordID != nil && capture.recordID == recordID) {
+            pasteCapture = nil
+            consumedPaste = capture
+            result = .success(capture.focus)
+        } else {
+            consumedPaste = nil
+            if requirePasteCapture || pasteCapture != nil { return .failure(InputMonitorError(reason: "awaiting Typeless paste")) }
+            result = currentFocus()
+        }
         if !dryRun, case .success(let snapshot) = result, !observeFocus(pid: snapshot.processID) {
             return .failure(InputMonitorError(reason: "focus notifications unavailable"))
         }
@@ -488,7 +618,7 @@ final class InputMonitor {
     private func inspectFocus(_ target: FocusSnapshot, deadline: TimeInterval) -> Result<FocusSnapshot, InputMonitorError> {
         if dryRun {
             guard focusReadable else { return .failure(InputMonitorError(reason: "cannot inspect caret/focus")) }
-            guard validSelectionRange(location: target.selectionStart, length: target.selectionLength) else {
+            guard !target.selectionAvailable || validSelectionRange(location: target.selectionStart, length: target.selectionLength) else {
                 return .failure(InputMonitorError(reason: "invalid caret/selection range"))
             }
             return .success(target)
@@ -496,55 +626,123 @@ final class InputMonitor {
         guard AXIsProcessTrusted(), NSRunningApplication(processIdentifier: target.processID)?.isTerminated == false else {
             return .failure(InputMonitorError(reason: "original application unavailable or accessibility not trusted"))
         }
+        guard case .success(let identity) = inspectIdentity(target, deadline: deadline) else {
+            return .failure(InputMonitorError(reason: "cannot inspect window/input focus"))
+        }
+        return inspectInput(identity, deadline: deadline)
+    }
+
+    // Read only identity. postToPid targets the application's current first
+    // responder, so a confirmed focus change cannot safely send to the old one.
+    private func inspectIdentity(_ target: FocusSnapshot, deadline: TimeInterval) -> Result<FocusSnapshot, InputMonitorError> {
+        if dryRun {
+            guard focusReadable else { return .failure(InputMonitorError(reason: "cannot inspect caret/focus")) }
+            let current = originalIsFrontmost(target) ? simulatedFocus : (simulatedOriginalApplicationFocus ?? target)
+            return .success(current)
+        }
         let app = AXUIElementCreateApplication(target.processID)
         guard let windowValue = attribute(app, kAXFocusedWindowAttribute, deadline: deadline), CFGetTypeID(windowValue) == AXUIElementGetTypeID(),
               let inputValue = attribute(app, kAXFocusedUIElementAttribute, deadline: deadline), CFGetTypeID(inputValue) == AXUIElementGetTypeID() else {
             return .failure(InputMonitorError(reason: "cannot inspect window/input focus"))
         }
-        let input = inputValue as! AXUIElement
-        var range = CFRange()
-        guard let rangeValue = attribute(input, kAXSelectedTextRangeAttribute, deadline: deadline), CFGetTypeID(rangeValue) == AXValueGetTypeID(),
-              AXValueGetValue(rangeValue as! AXValue, .cfRange, &range),
-              validSelectionRange(location: range.location, length: range.length),
-              let text = attribute(input, kAXValueAttribute, deadline: deadline) as? String,
-              ProcessInfo.processInfo.systemUptime < deadline else {
-            return .failure(InputMonitorError(reason: "cannot inspect content/caret/selection within budget"))
-        }
         return .success(FocusSnapshot(bundleID: target.bundleID, processID: target.processID,
-            window: (windowValue as! AXUIElement), input: input, selectionStart: range.location, selectionLength: range.length, text: text))
+            window: (windowValue as! AXUIElement), input: (inputValue as! AXUIElement)))
+    }
+
+    private func originalIdentityUnchanged(_ original: FocusSnapshot) -> Bool {
+        if case .success(let current) = inspectIdentity(original, deadline: ProcessInfo.processInfo.systemUptime + 0.025),
+           !original.sameTarget(as: current) {
+            cancelFromEvent("original input focus changed before delivery")
+            return false
+        }
+        return true
+    }
+
+    // Settlement and background notification reads use the captured input object,
+    // never the application's newly focused element after the user leaves.
+    private func inspectInput(_ target: FocusSnapshot, deadline: TimeInterval) -> Result<FocusSnapshot, InputMonitorError> {
+        if dryRun { return inspectFocus(target, deadline: deadline) }
+        guard let input = target.input, let text = attribute(input, kAXValueAttribute, deadline: deadline) as? String else {
+            return .failure(InputMonitorError(reason: "cannot inspect original input content"))
+        }
+        var snapshot = target
+        snapshot.text = text
+        snapshot.selectionAvailable = false
+        var range = CFRange()
+        if let value = attribute(input, kAXSelectedTextRangeAttribute, deadline: deadline),
+           CFGetTypeID(value) == AXValueGetTypeID(), AXValueGetValue(value as! AXValue, .cfRange, &range),
+           validSelectionRange(location: range.location, length: range.length) {
+            snapshot.selectionAvailable = true
+            snapshot.selectionStart = range.location
+            snapshot.selectionLength = range.length
+        }
+        return .success(snapshot)
     }
 
     // Typeless may finish its paste during the existing 150 ms paste buffer.
     // Freeze content and selection after that buffer, never after user editing.
     func settleAttempt(testEvent: Bool = false) {
         stateLock.lock(); defer { stateLock.unlock() }
-        // Test-only phase control avoids asserting on a wall-clock race. The
-        // real service always uses its normal 150 ms dispatch deadline.
         guard !manualTestSettlement || testEvent else { return }
         guard attemptActive, let original = armedFocus else { return }
-        let target = dryRun && normalizeBundleID(simulatedFocus.bundleID) != normalizeBundleID(original.bundleID)
-            ? simulatedOriginalFocus ?? original : (dryRun ? simulatedFocus : original)
-        let result = inspectFocus(target, deadline: ProcessInfo.processInfo.systemUptime + 0.025)
-        guard case .success(let current) = result, original.sameTarget(as: current) else {
+        let target = dryRun ? (simulatedOriginalFocus ?? original) : original
+        guard case .success(let current) = inspectInput(target, deadline: ProcessInfo.processInfo.systemUptime + 0.025),
+              original.sameTarget(as: current) else {
             cancelFromEvent("cannot settle original input"); return
         }
+        guard originalIdentityUnchanged(original) else { return }
+        let before = consumedPaste?.focus
+        let reportsSelection = before?.selectionAvailable == true && current.selectionAvailable &&
+            (before?.selectionStart != 0 || before?.selectionLength != 0 || current.selectionStart != 0 || current.selectionLength != 0)
+        if let before, !pastedText.isEmpty {
+            if PasteBaseline.settlementWasEdited(beforeText: before.text,
+                insertionStart: reportsSelection ? before.selectionStart : nil,
+                insertionLength: reportsSelection ? before.selectionLength : 0,
+                afterText: current.text, pastedText: pastedText) {
+                cancelFromEvent("original content edited during paste buffer")
+                return
+            }
+            if reportsSelection {
+                let (expectedCaret, overflow) = before.selectionStart.addingReportingOverflow(pastedText.utf16.count)
+                if overflow || current.selectionStart != expectedCaret || current.selectionLength != 0 {
+                    cancelFromEvent("original caret/selection changed during paste buffer")
+                    return
+                }
+            }
+        }
+        pasteBaseline = PasteBaseline(beforeText: before?.text,
+            insertionStart: reportsSelection ? before?.selectionStart : nil,
+            insertionLength: reportsSelection ? before?.selectionLength ?? 0 : 0, afterText: current.text, pastedText: pastedText)
         armedFocus = current
         settled = true
+        if let reason = pendingDeparture { pendingDeparture = nil; requestDeparture(reason) }
     }
 
     func validateAttempt(deadline: TimeInterval? = nil) -> Result<FocusSnapshot, InputMonitorError> {
         stateLock.lock(); defer { stateLock.unlock() }
-        guard attemptActive, !missedEvent.load(ordering: .acquiring), let original = armedFocus else { return .failure(InputMonitorError(reason: "attempt already consumed, cancelled or input inspection interrupted")) }
-        let result: Result<FocusSnapshot, InputMonitorError>
-        if dryRun {
-            // The seam retains the original application's last focus while another is active.
-            result = inspectFocus(normalizeBundleID(simulatedFocus.bundleID) == normalizeBundleID(original.bundleID) ? simulatedFocus : simulatedOriginalFocus ?? original, deadline: .infinity)
-        } else { result = inspectFocus(original, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025) }
-        guard case .success(let current) = result else { return result }
-        guard original.sameTarget(as: current), !settled || original.sameSelection(as: current) else {
-            return .failure(InputMonitorError(reason: "original content/caret/selection or focus changed"))
+        guard healthyForSend(), let original = armedFocus else {
+            return .failure(InputMonitorError(reason: "attempt already consumed, cancelled or input inspection interrupted"))
+        }
+        guard settled, originalIsFrontmost(original) else { return .success(original) }
+        let result = dryRun ? inspectFocus(simulatedFocus, deadline: .infinity)
+            : inspectFocus(original, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025)
+        // Only observed editing cancels. A transient AX read failure is not an edit.
+        guard case .success(let current) = result else { return .success(original) }
+        guard original.sameTarget(as: current) else {
+            cancelFromEvent("original input focus changed before delivery")
+            return .failure(InputMonitorError(reason: "original input focus changed before delivery"))
+        }
+        guard !contentWasEdited(current, baseline: original) else {
+            cancelFromEvent("original content/caret/selection changed")
+            return .failure(InputMonitorError(reason: "original content/caret/selection changed"))
         }
         return .success(current)
+    }
+
+    private func contentWasEdited(_ current: FocusSnapshot, baseline original: FocusSnapshot) -> Bool {
+        let selectionChanged = original.selectionAvailable && current.selectionAvailable &&
+            (original.selectionStart != current.selectionStart || original.selectionLength != current.selectionLength)
+        return pasteBaseline?.matches(current.text) == false || selectionChanged
     }
 
     func deliver(completion: @escaping (Bool) -> Void) {
@@ -559,16 +757,9 @@ final class InputMonitor {
                 return
             }
             defer { stateLock.unlock() }
-            let safe = epoch == attemptEpoch && settled && authorizeSend?() == true && {
-                if case .success = validateAttempt() { return true }; return false
-            }() && available && (dryRun || AXIsProcessTrusted())
-                && returnEvents.count == 2 && !missedEvent.load(ordering: .acquiring)
-            if safe, let original = armedFocus {
-                attemptActive = false
-                sentOnEventThread = true
-                lastSendReason = "original-pid"
-                if !dryRun { for key in returnEvents { key.postToPid(original.processID) } }
-            }
+            // The timer performs health/authorization checks only. All content
+            // and caret comparisons happen during foreground monitoring.
+            let safe = epoch == attemptEpoch && sendNow(reason: "original-pid", report: false)
             DispatchQueue.main.async { completion(safe) }
         }
         if dryRun { operation() }
@@ -595,7 +786,7 @@ final class InputMonitor {
                 guard let activeObserver = monitor.focusObserver, CFEqual(observer, activeObserver) else { return }
                 guard monitor.attemptActive, let original = monitor.armedFocus else { return }
                 if [kAXValueChangedNotification, kAXSelectedTextChangedNotification].contains(notification as String) {
-                    if monitor.settled { monitor.cancelFromEvent("original content/caret/selection changed") }
+                    if monitor.settled { _ = monitor.validateAttempt() }
                     return
                 }
                 var notified = original
@@ -616,20 +807,12 @@ final class InputMonitor {
     }
 
     private func handleFocusNotification(_ notified: FocusSnapshot) {
-        guard attemptActive, let original = armedFocus else { return }
-        // AX focus notifications identify the newly focused element. Check that
-        // payload as well as the current snapshot: a different payload still
-        // cancels if focus has already returned before this callback runs.
-        guard original.sameTarget(as: notified) else {
-            cancelFromEvent("window/input focus changed")
+        guard attemptActive, let original = armedFocus, originalIsFrontmost(original) else { return }
+        if !original.sameTarget(as: notified) {
+            cancelFromEvent("original input focus changed before delivery")
             return
         }
-        switch validateAttempt() {
-        case .success(let current):
-            if !original.sameTarget(as: current) { cancelFromEvent("window/input focus changed") }
-        case .failure(let error):
-            cancelFromEvent("cannot verify focus notification: \(error.reason)")
-        }
+        _ = validateAttempt()
     }
 
     func poll() {
@@ -655,47 +838,24 @@ final class InputMonitor {
                 onKeyboard?("simulated input event invalid")
                 continue
             }
-            if json["type"] as? String == "keyboard",
-               !["typeless", "typeless-helper-verified"].contains(json["origin"] as? String ?? "unknown"),
-               (json["key"] as? String == "fn" || (armedFocus.map({ normalizeBundleID($0.bundleID) == normalizeBundleID(simulatedFocus.bundleID) }) ?? false)) {
-                if json["key"] as? String != "command-tab" {
-                    cancelFromEvent("keyboard activity (including Fn/modifiers)")
-                }
-            }
             let type = json["type"] as? String
+            if type == "typeless_paste" || (type == "keyboard" && json["key"] as? String == "v" &&
+                ["typeless", "typeless-helper-verified"].contains(json["origin"] as? String ?? "")) { capturePaste() }
             if type == "settle", manualTestSettlement { settleAttempt(testEvent: true) }
-            if type == "transition", attemptActive {
-                let targetApp = json["app"] as? String ?? simulatedFocus.bundleID
-                if normalizeBundleID(targetApp) == normalizeBundleID(armedFocus?.bundleID ?? "") {
-                    var flags = CGEventFlags()
-                    for flag in json["modifiers"] as? [String] ?? [] {
-                        switch flag {
-                        case "command": flags.insert(.maskCommand)
-                        case "shift": flags.insert(.maskShift)
-                        case "control": flags.insert(.maskControl)
-                        case "option": flags.insert(.maskAlternate)
-                        default: flags.insert(.maskSecondaryFn)
-                        }
-                    }
-                    let decision: TransitionDecision
-                    if json["kind"] as? String == "tab" {
-                        decision = keyboardDecision(code: 48, flags: flags, repeated: json["repeat"] as? Bool ?? false,
-                            role: json["sourceRole"] as? String ?? kAXTextFieldRole, ascii: json["ascii"] as? Bool ?? true)
-                    } else {
-                        decision = mouseDecision(left: json["left"] as? Bool ?? true, flags: flags,
-                            role: json["targetRole"] as? String ?? kAXTextFieldRole,
-                            separate: json["verified"] as? Bool == true)
-                    }
-                    if decision == .send { sendBeforeTransition(proxy: nil, deadline: ProcessInfo.processInfo.systemUptime + 0.025) }
-                    else if decision == .cancel { cancelFromEvent("mouse/keyboard editing or uncertain focus transition") }
-                }
+            if type == "transition", json["kind"] as? String != "tab",
+               let original = attemptActive ? armedFocus : pasteCapture?.focus,
+               normalizeBundleID(json["app"] as? String ?? simulatedFocus.bundleID) == normalizeBundleID(original.bundleID) {
+                handleMouseTarget(json["sameInput"] as? Bool == true ? .inside : .outside, hitPID: original.processID)
             }
-            if type == "edit_notification", settled { cancelFromEvent("original content/caret/selection changed") }
+            if type == "edit_notification", settled { _ = validateAttempt() }
             if type == "focus_notification", var notified = armedFocus {
                 if let readable = json["focusReadable"] as? Bool { focusReadable = readable }
                 if let window = json["window"] as? String { notified.windowToken = window }
                 if let input = json["input"] as? String { notified.inputToken = input }
                 handleFocusNotification(notified)
+            }
+            if type == "deactivate" {
+                if let pid = armedFocus?.processID ?? pasteCapture?.focus.processID { applicationDeactivated(pid: pid) }
             }
             if type == "monitoring" {
                 if let value = json["enableSucceeds"] as? Bool { simulatedEnableSucceeds = value }
@@ -713,29 +873,56 @@ final class InputMonitor {
             if type == "capability" {
                 if let value = json["inputMonitoring"] as? Bool { simulatedMonitoring.permissionGranted = value }
                 if let value = json["focusReadable"] as? Bool { focusReadable = value }
+                if let value = json["processAlive"] as? Bool {
+                    simulatedProcessAlive = value
+                    if !value { cancelFromEvent("original application exited") }
+                }
+                if let value = json["accessibilityTrusted"] as? Bool {
+                    simulatedAccessibilityTrusted = value
+                    if !value { cancelFromEvent("accessibility permission lost") }
+                }
                 if let value = json["secureInput"] as? Bool { simulatedMonitoring.secureInputEnabled = value }
                 if !available {
                     observedMonitoringGap = true
                     onKeyboard?("input monitoring unavailable")
                 }
-                if !focusReadable { onFocusChange?("cannot inspect caret/focus") }
+
             }
-            if type == "focus" || type == "state" || type == "mouse" {
+            if type == "focus" || type == "state" || type == "mouse" || type == "unnotified_state" {
                 let before = simulatedFocus
-                if let app = json["app"] as? String {
-                    if let original = armedFocus, normalizeBundleID(before.bundleID) == normalizeBundleID(original.bundleID) { simulatedOriginalFocus = before }
-                    if let retained = simulatedOriginalFocus, normalizeBundleID(retained.bundleID) == normalizeBundleID(app) { simulatedFocus = retained }
-                    simulatedFocus.bundleID = app
-                }
+                if let app = json["app"] as? String { simulatedFocus.bundleID = app }
                 if let window = json["window"] as? String { simulatedFocus.windowToken = window }
                 if let input = json["input"] as? String { simulatedFocus.inputToken = input }
                 if let caret = json["caret"] as? Int { simulatedFocus.selectionStart = caret }
                 if let length = json["selectionLength"] as? Int { simulatedFocus.selectionLength = length }
+                if let value = json["selectionAvailable"] as? Bool { simulatedFocus.selectionAvailable = value }
                 if let text = json["text"] as? String { simulatedFocus.text = text }
-                if type == "mouse", !before.sameSelection(as: simulatedFocus) {
-                    onFocusChange?("mouse changed caret, selection or focus")
-                } else if normalizeBundleID(before.bundleID) == normalizeBundleID(simulatedFocus.bundleID), !before.sameTarget(as: simulatedFocus) {
-                    onFocusChange?("window/input/application focus changed")
+                if let original = armedFocus {
+                    if normalizeBundleID(simulatedFocus.bundleID) == normalizeBundleID(original.bundleID) {
+                        simulatedOriginalApplicationFocus = simulatedFocus
+                    } else if normalizeBundleID(before.bundleID) == normalizeBundleID(original.bundleID) {
+                        simulatedOriginalApplicationFocus = before
+                    }
+                    if original.sameTarget(as: simulatedFocus) { simulatedOriginalFocus = simulatedFocus }
+                    else if original.sameTarget(as: before) { simulatedOriginalFocus = before }
+                    if normalizeBundleID(before.bundleID) == normalizeBundleID(original.bundleID),
+                       normalizeBundleID(simulatedFocus.bundleID) != normalizeBundleID(original.bundleID) {
+                        applicationDeactivated(pid: original.processID)
+                    } else if originalIsFrontmost(original), !original.sameTarget(as: simulatedFocus) {
+                        handleFocusNotification(simulatedFocus)
+                    } else if settled && type != "unnotified_state" { _ = validateAttempt() }
+                }
+                if let capture = pasteCapture {
+                    if normalizeBundleID(simulatedFocus.bundleID) == normalizeBundleID(capture.focus.bundleID) {
+                        simulatedOriginalApplicationFocus = simulatedFocus
+                    } else if normalizeBundleID(before.bundleID) == normalizeBundleID(capture.focus.bundleID) {
+                        simulatedOriginalApplicationFocus = before
+                    }
+                    if capture.focus.sameTarget(as: simulatedFocus) { simulatedOriginalFocus = simulatedFocus }
+                    else if capture.focus.sameTarget(as: before) {
+                        simulatedOriginalFocus = before
+                        pasteCapture?.departed = true
+                    }
                 }
             }
         }

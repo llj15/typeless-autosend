@@ -66,6 +66,7 @@ exit(mismatches == 0 ? 0 : 1)
 ''')
             binary = root / "focus-race"
             compile_result = subprocess.run(["swiftc", "-O", str(ROOT / "InputMonitor.swift"),
+                str(ROOT / "PasteBaseline.swift"),
                 str(ROOT / "Settings.swift"), str(root / "main.swift"), "-o", str(binary)],
                 capture_output=True, text=True, timeout=120)
             self.assertEqual(compile_result.returncode, 0, compile_result.stdout + compile_result.stderr)
