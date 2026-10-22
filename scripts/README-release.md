@@ -22,9 +22,11 @@ downloaded archive and extracted directory after installation.
 The installer runs `doctor` automatically. If it reports missing Accessibility
 or input-listening permission, the installer opens Accessibility settings and
 prints authorization steps. When checks pass, no permission setup is needed.
-For a permission failure, enable the installed executable shown in its output,
-then run the printed `launchctl kickstart` command. An upgrade may
-require removing a stale Accessibility entry and adding the new executable.
+For a permission failure, remove the existing typeless-autosend entry with −
+(skip this step if there is no entry), click + to add the current executable shown
+in the installer output, and turn on its switch. Then run the printed
+`launchctl kickstart` command and `typeless-autosend doctor`; `All good` means setup
+is complete.
 Separate Input Monitoring permission is not required. The binary is ad-hoc signed;
 this release is not Developer ID signed or notarized. If macOS blocks a downloaded
 file, use its system approval flow before continuing.
