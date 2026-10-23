@@ -1,22 +1,24 @@
 # Leave-to-send implementation notes
 
-The requested behavior is specified in [design-leave-to-send.md](design-leave-to-send.md). The implementation and its tests include the following explicit limits. The pull request remains a draft for review of these limits.
+The requested behavior is specified in [design-leave-to-send.md](design-leave-to-send.md). These notes describe delivery decisions, content alignment and the unit-test verification boundary.
 
-## Delivery after a same-application focus change
+## Delivery on departure
 
-`CGEvent.postToPid` selects a process, not an Accessibility input object. AppKit dispatches ordinary key events through the current key window and first responder, as documented in [Apple's Handling Key Events guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/HandlingKeyEvents/HandlingKeyEvents.html).
+Changing to another window or input in the original application requests immediate delivery to the captured PID. It does not cancel the attempt. Application deactivation takes the same delivery path. During the 150 ms paste buffer, departure is retained until settlement reads the captured original input and establishes its baseline, then delivery proceeds.
 
-Consequently, posting Return after another input or window has gained focus can submit the new input. Saving the original AX object does not change keyboard routing. This conflicts with the design's combination of sending after any same-application focus change and retaining PID-only delivery.
+Departure checks the captured original input object for a confirmed protected-content or caret change; it does not compare the newly focused input against the old baseline. Unknown focus identity or unreadable text alone is not proof of editing. Confirmed editing, a newer local record, missing permissions, Secure Input and process exit still prevent delivery.
 
-The implementation cancels when it observes such a completed focus change. It also cancels a departure during the paste buffer if focus has already moved to a different input before settlement. Outside clicks after settlement can still post while their event-tap callback holds the click. The callback orders the post call before releasing the click; unit tests do not establish the receiving application's native processing order.
+Within the same window, a focused child or non-window ancestor proven to belong to the original input keeps the countdown. A relationship that cannot be determined also waits for later observations or expiry. A confirmed different window requests delivery independently of input ancestry. Focus and deactivation notifications that arrive while the state lock is busy are retained; delivery waits for queued notifications, and capture generations and attempt epochs keep old events from affecting new work.
 
-Departure requires confirmation of the original application's focused window and input identity. An unreadable identity cancels instead of treating an unknown receiver as the original input. This adds a cancellation case beyond the original design. Content reads and identity reads are handled separately: an unreadable text value alone does not prove editing, and expiry does not reread text or selection.
+After settlement, an outside click posts while its event-tap callback holds the click. The callback orders the post call before releasing the click. During the buffer, the click records departure and settlement sends later; that click is not retained for replay.
+
+An existing mouse limitation remains: an outside click between paste capture and arming can be missed when the state lock is busy. If that click causes no observable focus change, delivery waits for expiry. This window-switch correction does not change the physical mouse callback's contention policy.
 
 When hit testing returns only the original window/application boundary, or parent traversal is incomplete, the relationship is unknown. Such a click does not trigger an early send. A blank-area click whose target cannot be distinguished from the original input therefore waits for another confirmed departure or expiry.
 
-Supporting the original behavior for these cases requires a separate routing design: intercepting and deferring transitions, or a supported element-level submission/focus mechanism. Neither is introduced implicitly in this change.
+Delivery keeps the design's existing `CGEvent.postToPid` mechanism. The unit tests establish when delivery is requested, which PID is retained, and that an attempt sends at most once. They do not establish which native window or first responder ultimately receives Return after a focus transition. AppKit describes ordinary keyboard dispatch in [Apple's Handling Key Events guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/HandlingKeyEvents/HandlingKeyEvents.html). No window-specific injection, input refocusing, or element-level submission action is introduced in this change.
 
-Expiry relies on the latest foreground observations and notifications, then checks health and authorization without another AX read. A focus or content change whose notification has not yet arrived can fall between the last observation and actual event delivery. This change does not claim an atomic guarantee about native first-responder routing; that remains outside the unit-test evidence.
+Expiry relies on the latest foreground observations and notifications, then checks health and authorization without another AX read. A focus or content change whose notification has not yet arrived can fall between the last observation and actual event delivery. Native application processing order remains outside the unit-test evidence.
 
 ## Paste association and content alignment
 

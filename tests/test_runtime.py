@@ -246,16 +246,18 @@ class Runtime(unittest.TestCase):
         self.wait_for("would enter id=paste-race ", timeout=0.5)
         self.assertNotIn("skip id=paste-race ", self.text())
 
-    def test_buffer_departure_that_already_changed_input_never_sends_to_new_input(self):
+    def test_buffer_outside_click_then_focus_change_sends_once_after_settlement(self):
         self.configure(delaySeconds=2)
         self.start(TYPELESS_TEST_MANUAL_SETTLE="1")
         self.complete("buffer-new-input")
         self.wait_pending_file()
         self.event("transition", verified=True)
         self.event("focus", input="another-input")
+        self.assert_no_send("buffer-new-input", seconds=0.1)
         self.event("settle")
-        self.wait_for("skip id=buffer-new-input ")
-        self.assert_no_send("buffer-new-input", seconds=0.4)
+        self.wait_for("would enter id=buffer-new-input destination=original-pid", timeout=0.5)
+        self.assertEqual(self.text().count("would enter id=buffer-new-input "), 1)
+        self.assertNotIn("skip id=buffer-new-input ", self.text())
 
     def test_no_pending_attempt_never_sends_on_transition(self):
         self.start()
@@ -320,7 +322,7 @@ class Runtime(unittest.TestCase):
         self.wait_for("would enter id=redundant-focus ")
         self.assertNotIn("skip id=redundant-focus ", self.text())
 
-    def test_notification_for_another_target_cancels_even_if_current_focus_has_returned(self):
+    def test_notification_for_another_target_sends_once_even_if_focus_has_returned(self):
         self.configure(delaySeconds=2)
         self.start()
         for field, original in [("window", "window-1"), ("input", "input-1")]:
@@ -330,8 +332,25 @@ class Runtime(unittest.TestCase):
                 time.sleep(0.3)
                 self.event("focus_notification", **{field: "elsewhere"})
                 self.event("focus_notification", **{field: original})
-                self.wait_for(f"skip id={identifier} ", timeout=0.5)
-                self.assert_no_send(identifier, seconds=0.4)
+                self.wait_for(f"would enter id={identifier} destination=original-pid", timeout=0.5)
+                self.assertEqual(self.text().count(f"would enter id={identifier} "), 1)
+                self.assertNotIn(f"skip id={identifier} ", self.text())
+
+    def test_same_application_departure_during_paste_buffer_sends_after_settlement(self):
+        self.configure(delaySeconds=2)
+        self.start(TYPELESS_TEST_MANUAL_SETTLE="1")
+        for field in ["window", "input"]:
+            with self.subTest(field=field):
+                self.event("focus", window="window-1", input="input-1")
+                identifier = f"buffer-{field}"
+                self.complete(identifier)
+                self.wait_pending_file()
+                self.event("focus", **{field: "elsewhere"})
+                self.assert_no_send(identifier, seconds=0.15)
+                self.event("settle")
+                self.wait_for(f"would enter id={identifier} destination=original-pid", timeout=0.5)
+                self.assertEqual(self.text().count(f"would enter id={identifier} "), 1)
+                self.assertNotIn(f"skip id={identifier} ", self.text())
 
     def test_unreadable_ax_content_is_not_editing_and_timeout_still_sends(self):
         self.configure(delaySeconds=0.5)
@@ -556,7 +575,7 @@ class Runtime(unittest.TestCase):
                 self.wait_for(f"would enter id={key} ")
                 self.assertNotIn(f"skip id={key} ", self.text())
 
-    def test_window_and_input_switches_cancel_even_when_returned_before_next_poll(self):
+    def test_window_and_input_switches_send_once_before_the_countdown_expires(self):
         self.configure(delaySeconds=2)
         self.start()
         for field, original in [("window", "window-1"), ("input", "input-1")]:
@@ -565,8 +584,9 @@ class Runtime(unittest.TestCase):
                 time.sleep(0.3)
                 self.event("focus", **{field: "elsewhere"})
                 self.event("focus", **{field: original})
-                self.wait_for(f"skip id={field} ", timeout=0.5)
-                self.assert_no_send(field, seconds=0.4)
+                self.wait_for(f"would enter id={field} destination=original-pid", timeout=0.5)
+                self.assertEqual(self.text().count(f"would enter id={field} "), 1)
+                self.assertNotIn(f"skip id={field} ", self.text())
 
     def test_removing_app_cancels_pending_permanently(self):
         self.start()

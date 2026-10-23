@@ -43,6 +43,42 @@ func delivered(_ m: InputMonitor) -> Bool {
     while value == nil { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
     return value!
 }
+// Focus changes are departures even within the same process. Each dedicated
+// rule runs independently so TDD reports both settled and buffer failures.
+let selectedRule = CommandLine.arguments.dropFirst(2).first
+if ["window-after-settle", "window-during-buffer", "window-before-observation"].contains(selectedRule ?? "") {
+    let m = make(requirePaste: true)
+    event(m, "state", ["pid": 4242, "text": "draft ", "caret": 6])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "draft hello", "caret": 11])
+    if selectedRule == "window-before-observation" {
+        event(m, "unnotified_state", ["pid": 4242, "window": "window-2", "input": "input-2", "text": "unrelated destination", "caret": 3])
+    }
+    guard case .success(let original) = m.beginAttempt() else { fatalError("window departure original target") }
+    expect(original.processID == 4242, "paste capture retains a nonzero original PID")
+    var sends = 0
+    m.onSent = { _ in sends += 1 }
+    m.armAttempt(focus: original, pastedText: "hello", authorize: { true })
+    if selectedRule == "window-after-settle" { m.settleAttempt() }
+    if selectedRule != "window-before-observation" {
+        event(m, "focus", ["pid": 4242, "window": "window-2", "input": "input-2", "text": "unrelated destination", "caret": 3])
+    }
+    if selectedRule != "window-after-settle" {
+        expect(!m.sentAwaitingReport, "buffer window departure waits for settlement")
+        m.settleAttempt()
+    }
+    expect(m.sentAwaitingReport, "same-PID window departure sends once after required settlement")
+    expect(m.sentReason == "original-pid", "window departure retains original-PID send intent")
+    expect(m.preparedReturnTargetPIDs == [4242, 4242], "prepared Return down/up events retain the captured original PID")
+    expect(sends == 1, "window departure sends exactly once")
+    guard case .success(let changed) = m.currentFocus() else { fatalError("changed window identity") }
+    expect(changed.processID == original.processID, "window switch stays within original PID")
+    event(m, "focus_notification", ["window": "window-3", "input": "input-3"])
+    m.settleAttempt()
+    expect(!delivered(m) && sends == 1, "duplicate focus and timer cannot resend window departure")
+    print("monitor checks=\(checks)")
+    exit(0)
+}
 // Native registration strategy tolerates unsupported value/selection events;
 // apps that only expose a value are covered by the polling backup.
 do {
@@ -111,6 +147,113 @@ for notification in [kAXValueChangedNotification, kAXSelectedTextChangedNotifica
     release.signal()
     expect(finished.wait(timeout: .now() + 2) == .success, "AX callback returns without blocking input thread")
     expect(delivered(m), "contended redundant content notification still permits send")
+}
+// Workspace deactivation uses the same delayed-departure guarantee when a
+// database/AX operation holds stateLock. Its timer must not overtake it either.
+do {
+    let m = make(); arm(m)
+    let epoch = m.currentObservationToken!.epoch
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    var sends = 0
+    m.onSent = { _ in sends += 1 }
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "deactivation-record" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "deactivation worker holds state lock")
+    m.applicationDeactivated(pid: 0)
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "deactivation callback returns without blocking")
+    expect(valid(m), "contended deactivation does not poison active countdown")
+    var timerResult: Bool?
+    m.performDelivery(epoch: epoch) { timerResult = $0 }
+    let deadline = Date().addingTimeInterval(2)
+    while timerResult == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+    expect(timerResult != nil && m.sentAwaitingReport && sends == 1, "queued deactivation sends once before timer")
+    expect(!delivered(m) && sends == 1, "deactivation and timer cannot resend")
+}
+// Deactivation that arrived during capture is not lost merely because arm
+// published a new attempt epoch before the deferred event got the state lock.
+do {
+    let m = make(requirePaste: true)
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "prearm-deactivation-record" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "pre-arm deactivation worker holds lock")
+    m.applicationDeactivated(pid: 0)
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "pre-arm deactivation returns promptly")
+    guard case .success(let f) = m.beginAttempt(recordID: "prearm-deactivation-record") else { fatalError("pre-arm deactivation capture") }
+    m.armAttempt(focus: f, authorize: { true }); m.settleAttempt()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.03))
+    expect(m.sentAwaitingReport, "deferred deactivation follows the same capture across arm epoch")
+    expect(!delivered(m), "pre-arm deactivation sends once")
+}
+// The same older event must not mark an unrelated newer paste capture as left.
+do {
+    let m = make(requirePaste: true)
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "old-deactivation-capture" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "old capture deactivation worker holds lock")
+    m.applicationDeactivated(pid: 0)
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "old capture deactivation returns promptly")
+    m.pasteRecordIDProvider = { "new-deactivation-capture" }
+    event(m, "typeless_paste")
+    RunLoop.main.run(until: Date().addingTimeInterval(0.03))
+    guard case .success(let f) = m.beginAttempt(recordID: "new-deactivation-capture") else { fatalError("fresh capture after old deactivation") }
+    m.armAttempt(focus: f, authorize: { true }); m.settleAttempt()
+    expect(valid(m) && !m.sentAwaitingReport, "old deactivation cannot mark a newer capture as departed")
+}
+do {
+    let m = make(); arm(m)
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "ended-deactivation-record" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "ended deactivation worker holds lock")
+    m.applicationDeactivated(pid: 0)
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "ended deactivation returns promptly")
+    _ = m.endAttempt()
+    guard case .success(let f) = m.currentFocus() else { fatalError("new attempt after old deactivation") }
+    m.armAttempt(focus: f, authorize: { true }); m.settleAttempt()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.03))
+    expect(valid(m) && !m.sentAwaitingReport, "old epoch deactivation cannot send or cancel a new attempt")
+}
+// A focus notification arriving during an AX read is a departure to process,
+// not a monitoring gap. A simultaneous timer must wait for that queued event.
+for notification in [kAXFocusedWindowChangedNotification, kAXFocusedUIElementChangedNotification] {
+    let m = make(); arm(m)
+    let token = m.currentObservationToken!
+    let locked = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    var sends = 0
+    m.onSent = { _ in sends += 1 }
+    m.pasteRecordIDProvider = { locked.signal(); release.wait(); return "focus-notification-record" }
+    DispatchQueue.global().async { event(m, "typeless_paste"); finished.signal() }
+    expect(locked.wait(timeout: .now() + 2) == .success, "focus-notification worker holds state lock")
+    let fakeTarget = AXUIElementCreateApplication(0)
+    m.handleAXNotification(notification, token: token, element: fakeTarget)
+    release.signal()
+    expect(finished.wait(timeout: .now() + 2) == .success, "contended focus callback returns immediately")
+    expect(valid(m), "contended focus notification does not poison the active attempt")
+    var timerResult: Bool?
+    m.performDelivery(epoch: token.epoch) { timerResult = $0 }
+    let deadline = Date().addingTimeInterval(2)
+    while timerResult == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+    expect(timerResult != nil, "timer finishes after the queued focus notification")
+    expect(m.sentAwaitingReport && sends == 1, "queued focus departure sends once before a competing timer")
+    expect(m.sentReason == "original-pid", "queued focus departure keeps original PID send intent")
+    m.handleAXNotification(notification, token: token, element: fakeTarget)
+    expect(!delivered(m) && sends == 1, "duplicate focus notification and timer cannot send twice")
 }
 // A deferred value notification must compare the latest protected region
 // before a timer can send; reverting afterwards never resurrects the attempt.
@@ -298,7 +441,7 @@ do {
     event(m, "transition", ["sameInput": true])
     expect(valid(m), "original input and descendants preserve attempt")
     event(m, "focus_notification", ["window": "another-window"])
-    expect(!m.sentAwaitingReport && !valid(m), "changed first responder cancels instead of sending to the new input")
+    expect(m.sentAwaitingReport && m.sentReason == "original-pid", "same-app window departure sends immediately to original PID")
 }
 do {
     let m = make(); arm(m)
@@ -380,7 +523,7 @@ do {
     event(m, "focus", ["window": "other-window", "input": "other-input", "text": "other content"])
     expect(!m.sentAwaitingReport, "buffer focus departure waits")
     m.settleAttempt()
-    expect(!m.sentAwaitingReport && !valid(m), "buffer focus change cancels instead of sending to new responder")
+    expect(m.sentAwaitingReport && m.sentReason == "original-pid", "buffer focus departure sends after reading captured original input")
 }
 do {
     let m = make(); guard case .success(let f) = m.beginAttempt() else { fatalError() }
@@ -405,7 +548,7 @@ do {
     expect(!m.sentAwaitingReport, "departure cannot send an unobserved caret edit")
 }
 // Text can be temporarily unreadable while identity is still confirmed. A
-// routing-identity failure is different: leaving must fail closed permanently.
+// temporarily unreadable focus identity is not itself proof of editing.
 do {
     let m = make(); arm(m)
     event(m, "capability", ["focusReadable": false, "identityReadable": true])
@@ -416,14 +559,16 @@ do {
     let m = make(); arm(m)
     event(m, "capability", ["identityReadable": false])
     event(m, "deactivate")
-    expect(!m.sentAwaitingReport, "departure never sends when input routing identity is unknown")
+    expect(m.sentAwaitingReport && m.sentReason == "original-pid", "unreadable current identity does not cancel original-PID departure")
     event(m, "capability", ["identityReadable": true])
-    expect(!delivered(m), "unknown departure identity cancellation is permanent")
+    expect(!delivered(m), "completed departure cannot send twice after identity recovers")
 }
 do {
     let m = make(); arm(m)
     event(m, "capability", ["identityReadable": false])
-    expect(!valid(m), "foreground identity inspection failure cancels")
+    expect(valid(m) && !m.sentAwaitingReport, "foreground identity inspection failure preserves countdown")
+    event(m, "unnotified_state", ["text": "edited while current identity is unreadable"])
+    expect(!valid(m), "captured input edits still cancel when current identity is unreadable")
 }
 // A verified paste event alone is not evidence that any text reached the
 // input. A completely empty snapshot B must never cause an empty Return.
@@ -450,6 +595,23 @@ do {
     guard case .success(let f) = m.beginAttempt() else { fatalError("identical selected-text replacement") }
     m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
     expect(delivered(m), "same nonempty text replacing a selection is a valid paste")
+}
+// Focus departure still requires every send authorization and health gate.
+for failure in ["authorization", "new-record", "permission", "secure-input", "process-exit"] {
+    let m = make()
+    guard case .success(let original) = m.beginAttempt() else { fatalError("gated window departure") }
+    var authorized = true
+    var newerRecord = false
+    m.armAttempt(focus: original, authorize: { authorized && !newerRecord }); m.settleAttempt()
+    switch failure {
+    case "authorization": authorized = false
+    case "new-record": newerRecord = true
+    case "permission": event(m, "capability", ["inputMonitoring": false])
+    case "secure-input": event(m, "capability", ["secureInput": true])
+    default: event(m, "capability", ["processAlive": false])
+    }
+    event(m, "focus", ["window": "window-2", "input": "input-2"])
+    expect(!m.sentAwaitingReport && !delivered(m), "window departure respects authorization and health: \(failure)")
 }
 // Buffering may finish the system paste, but may not absorb an intervening
 // user edit into snapshot B. The same protection works without caret metadata.
@@ -482,9 +644,12 @@ print("monitor checks=\(checks)")
                                       capture_output=True, text=True, timeout=120)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
             (root / "events.jsonl").touch()
-            result = subprocess.run([binary, str(root / "events.jsonl")], capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("monitor checks=", result.stdout)
+            for rule in ("all", "window-after-settle", "window-during-buffer", "window-before-observation"):
+                with self.subTest(rule=rule):
+                    result = subprocess.run([binary, str(root / "events.jsonl"), rule],
+                                            capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("monitor checks=", result.stdout)
 
 if __name__ == "__main__":
     unittest.main()
