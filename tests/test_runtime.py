@@ -588,6 +588,19 @@ class Runtime(unittest.TestCase):
                 self.assertEqual(self.text().count(f"would enter id={field} "), 1)
                 self.assertNotIn(f"skip id={field} ", self.text())
 
+    def test_composer_departure_ignores_blurred_original_selection_reset(self):
+        self.configure(delaySeconds=2)
+        self.event("state", text="hello", caret=5)
+        self.start()
+        self.complete("composer-blur")
+        self.wait_pending_file()
+        time.sleep(0.3)
+        self.event("unnotified_state", caret=0)
+        self.event("focus", input="message-editor", text="other input", caret=0)
+        self.wait_for("would enter id=composer-blur destination=original-pid", timeout=0.5)
+        self.assertEqual(self.text().count("would enter id=composer-blur "), 1)
+        self.assertNotIn("skip id=composer-blur ", self.text())
+
     def test_removing_app_cancels_pending_permanently(self):
         self.start()
         self.complete("removed")

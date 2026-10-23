@@ -21,6 +21,9 @@ import Foundation
 let data = FileHandle.standardInput.readDataToEndOfFile()
 let cases = try! JSONSerialization.jsonObject(with: data) as! [[String: Any]]
 let results = cases.map { item -> Bool in
+    if item["operation"] as? String == "evidence" {
+        return PasteBaseline.hasPastedTextEvidence(in: item["text"] as! String, pastedText: item["pasted"] as! String)
+    }
     if item["operation"] as? String == "settlement" {
         return PasteBaseline.settlementWasEdited(
             beforeText: item["before"] as! String,
@@ -57,6 +60,13 @@ print(String(data: try! JSONSerialization.data(withJSONObject: results), encodin
     def check_settlement(self, *, before, start=None, length=0, after, pasted, expected):
         case = dict(operation="settlement", before=before, start=start, length=length,
                     after=after, pasted=pasted)
+        result = subprocess.run([self.binary], input=json.dumps([case]),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout), [expected], case)
+
+    def check_evidence(self, *, text, pasted, expected):
+        case = dict(operation="evidence", text=text, pasted=pasted)
         result = subprocess.run([self.binary], input=json.dumps([case]),
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -220,6 +230,35 @@ print(String(data: try! JSONSerialization.data(withJSONObject: results), encodin
             self.check_settlement(**values, after="first\r\nsecond\r\n", expected=True)
             self.check_settlement(**values, after="first\nsecond\r\n", expected=False)
         self.check_settlement(before="draft ", after="draft hello", pasted="hello\n", expected=True)
+
+    def test_paste_evidence_rejects_history_refresh_without_actual_transcription(self):
+        self.check_evidence(text="new history\n> ", pasted="hello", expected=False)
+        self.check_evidence(text="new history\n> hello", pasted="hello", expected=True)
+        # Evidence is a minimum content condition, rather than a history-count heuristic.
+        self.check_evidence(text="hello\n> ", pasted="hello", expected=True)
+
+    def test_paste_evidence_accepts_multiline_and_crlf_lf_equivalence(self):
+        self.check_evidence(text="prefix\r\n你好🌍\r\nsecond\r\nsuffix", pasted="你好🌍\nsecond\n", expected=True)
+        self.check_evidence(text="你好🌍\nsecond", pasted="你好🌍\r\nsecond\r\n", expected=True)
+        self.check_evidence(text="hello", pasted="hello\n", expected=True)
+        self.check_evidence(text="hello", pasted="hello\r\n", expected=True)
+
+    def test_paste_evidence_does_not_discard_substantive_characters_or_extra_newlines(self):
+        for text, pasted in (("hell", "hello"), ("hello", "hello!"), ("hello", " hello "),
+                             ("hello", "\nhello"), ("hello", "hello\n\n"),
+                             ('say “hello”', 'say "hello"'), ("你好", "你好🌍")):
+            with self.subTest(text=text, pasted=pasted):
+                self.check_evidence(text=text, pasted=pasted, expected=False)
+        self.check_evidence(text="hello\n", pasted="hello\n\n", expected=True)
+        self.check_evidence(text="prefix hello! suffix", pasted="hello!", expected=True)
+
+    def test_paste_evidence_rejects_empty_or_only_whitespace_values(self):
+        for text in ("", "\n", "\r\n\n", " \t\n"):
+            with self.subTest(text=text):
+                self.check_evidence(text=text, pasted="hello", expected=False)
+        for pasted in ("", "\n", "\r\n\n", " \t\n"):
+            with self.subTest(pasted=pasted):
+                self.check_evidence(text="hello\n", pasted=pasted, expected=False)
 
 
 if __name__ == "__main__":

@@ -28,9 +28,11 @@ func event(_ monitor: InputMonitor, _ type: String, _ fields: [String: Any] = [:
     try! handle.seekToEnd(); try! handle.write(contentsOf: data + Data([10])); try! handle.close()
     monitor.poll()
 }
-func make(requirePaste: Bool = false) -> InputMonitor {
+final class LogicalClock { var now: TimeInterval = 0 }
+func make(requirePaste: Bool = false, manualSettle: Bool = false,
+          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) -> InputMonitor {
     try! Data().write(to: URL(fileURLWithPath: events))
-    return InputMonitor(dryRun: true, environment: ["TYPELESS_TEST_EVENTS": events, "TYPELESS_FAKE_FRONT": app, "TYPELESS_TEST_REQUIRE_PASTE": requirePaste ? "1" : "0", "TYPELESS_TEST_TYPELESS_PID": "42"])
+    return InputMonitor(dryRun: true, environment: ["TYPELESS_TEST_EVENTS": events, "TYPELESS_FAKE_FRONT": app, "TYPELESS_TEST_REQUIRE_PASTE": requirePaste ? "1" : "0", "TYPELESS_TEST_TYPELESS_PID": "42", "TYPELESS_TEST_MANUAL_SETTLE": manualSettle ? "1" : "0"], settlementNow: now)
 }
 func arm(_ m: InputMonitor) {
     guard case .success(let f) = m.beginAttempt() else { fatalError("focus") }
@@ -46,6 +48,144 @@ func delivered(_ m: InputMonitor) -> Bool {
 // Focus changes are departures even within the same process. Each dedicated
 // rule runs independently so TDD reports both settled and buffer failures.
 let selectedRule = CommandLine.arguments.dropFirst(2).first
+if selectedRule == "settlement-cache" {
+    for initial in ["", "> "] {
+        for leave in [false, true] {
+            let clock = LogicalClock()
+            let m = make(requirePaste: true, manualSettle: true, now: { clock.now })
+            event(m, "state", ["text": initial])
+            event(m, "typeless_paste")
+            guard case .success(let f) = m.beginAttempt() else { fatalError("cached paste capture") }
+            m.armAttempt(focus: f, pastedText: "hello", authorize: { true })
+            clock.now = 0.15
+            m.settleAttempt(testEvent: true)
+            expect(valid(m), "150ms cached snapshot stays pending instead of cancelling")
+            let epoch = m.currentObservationToken!.epoch
+            var timerResult: Bool?
+            var completions = 0
+            m.performDelivery(epoch: epoch) { timerResult = $0; completions += 1 }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.015))
+            expect(timerResult == nil && !m.sentAwaitingReport, "zero-delay timer waits for real paste observation")
+            if leave { event(m, "deactivate") }
+            clock.now = 0.45
+            m.settleAttempt(testEvent: true)
+            expect(valid(m) && !m.sentAwaitingReport, "still-cached snapshot and departure remain pending")
+            clock.now = 0.55
+            event(m, "state", ["text": initial + "hello"])
+            m.settleAttempt(testEvent: true)
+            let deadline = Date().addingTimeInterval(2)
+            while timerResult == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+            expect(m.sentAwaitingReport && completions == 1, "fresh 500ms snapshot permits exactly one delivery")
+            expect(!delivered(m), "settlement completion and pending departure never duplicate delivery")
+        }
+    }
+    print("monitor checks=\(checks)"); exit(0)
+}
+if selectedRule == "settlement-delivery" {
+    let clock = LogicalClock()
+    let m = make(manualSettle: true, now: { clock.now })
+    guard case .success(let f) = m.beginAttempt() else { fatalError("pending delivery target") }
+    m.armAttempt(focus: f, authorize: { true })
+    var result: Bool?
+    m.performDelivery(epoch: m.currentObservationToken!.epoch) { result = $0 }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    expect(result == nil && valid(m), "timer cannot fail an unsettled attempt")
+    m.settleAttempt(testEvent: true)
+    let deadline = Date().addingTimeInterval(2)
+    while result == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+    expect(result == true, "waiting timer sends after settlement completes")
+    print("monitor checks=\(checks)"); exit(0)
+}
+if selectedRule == "settlement-expiry" {
+    for initial in ["", "> "] {
+        let clock = LogicalClock()
+        let m = make(requirePaste: true, manualSettle: true, now: { clock.now })
+        event(m, "state", ["text": initial])
+        event(m, "typeless_paste")
+        guard case .success(let f) = m.beginAttempt() else { fatalError("unobserved paste target") }
+        var cancellations = 0
+        var reason = ""
+        m.onKeyboard = { reason = $0; cancellations += 1 }
+        m.armAttempt(focus: f, pastedText: "hello", authorize: { true })
+        clock.now = 0.15; m.settleAttempt(testEvent: true)
+        expect(valid(m) && cancellations == 0, "unobserved paste is not cancelled at first sample")
+        if initial.isEmpty {
+            var timeoutResult: Bool?
+            m.performDelivery(epoch: m.currentObservationToken!.epoch) { timeoutResult = $0 }
+            clock.now = 1.01
+            let deadline = Date().addingTimeInterval(2)
+            while timeoutResult == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+            expect(timeoutResult == false, "waiting timer enforces the finite settlement deadline without reading text")
+        } else {
+            clock.now = 1.01; m.settleAttempt(testEvent: true)
+        }
+        expect(!valid(m) && !delivered(m) && cancellations == 1, "unobserved paste expires once within its finite budget")
+        expect(reason.contains("no pasted text observed"), "expiry retains the no-paste safety reason")
+        event(m, "state", ["text": initial + "hello"])
+        m.settleAttempt(testEvent: true)
+        expect(!delivered(m) && cancellations == 1, "late AX update never revives an expired paste")
+    }
+    print("monitor checks=\(checks)"); exit(0)
+}
+if selectedRule == "settlement-autoretry" {
+    let clock = LogicalClock()
+    let m = make(requirePaste: true, now: { clock.now })
+    event(m, "state", ["text": "> "])
+    event(m, "typeless_paste")
+    guard case .success(let f) = m.beginAttempt() else { fatalError("automatic AX retry target") }
+    var sends = 0
+    m.onSent = { _ in sends += 1 }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true })
+    clock.now = 0.15; m.settleAttempt()
+    expect(valid(m), "automatic retry retains a cached first sample")
+    event(m, "deactivate")
+    var result: Bool?
+    m.performDelivery(epoch: m.currentObservationToken!.epoch) { result = $0 }
+    clock.now = 0.55
+    event(m, "state", ["text": "> hello"])
+    let deadline = Date().addingTimeInterval(2)
+    while result == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+    expect(result != nil && m.sentAwaitingReport && sends == 1, "scheduled retry observes fresh B and completes pending departure without manual settlement")
+    expect(!delivered(m), "automatic settlement and timer do not duplicate a departure")
+    print("monitor checks=\(checks)"); exit(0)
+}
+if selectedRule == "settlement-epoch" {
+    let clock = LogicalClock()
+    let m = make(requirePaste: true, now: { clock.now })
+    event(m, "state", ["text": "old "])
+    event(m, "typeless_paste")
+    guard case .success(let old) = m.beginAttempt() else { fatalError("old cached capture") }
+    m.armAttempt(focus: old, pastedText: "hello", authorize: { true })
+    m.settleAttempt()
+    expect(valid(m), "old pending settlement schedules a retry")
+    var oldDelivery: Bool?
+    m.performDelivery(epoch: m.currentObservationToken!.epoch) { oldDelivery = $0 }
+    _ = m.endAttempt()
+    event(m, "state", ["text": "next ", "caret": 5])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "next world", "caret": 10])
+    guard case .success(let new) = m.beginAttempt() else { fatalError("new capture after pending settlement") }
+    m.armAttempt(focus: new, pastedText: "world", authorize: { true }); m.settleAttempt()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+    expect(oldDelivery == false && valid(m) && !m.sentAwaitingReport, "old settlement and delivery retries cannot affect a new epoch")
+    expect(delivered(m), "new settled epoch remains deliverable")
+    print("monitor checks=\(checks)"); exit(0)
+}
+if selectedRule == "settlement-edited" {
+    let clock = LogicalClock()
+    let m = make(requirePaste: true, manualSettle: true, now: { clock.now })
+    event(m, "state", ["text": "draft ", "caret": 6])
+    event(m, "typeless_paste")
+    guard case .success(let f) = m.beginAttempt() else { fatalError("cached edit target") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true })
+    clock.now = 0.15; m.settleAttempt(testEvent: true)
+    expect(valid(m), "cached edit target waits for a fresh snapshot")
+    clock.now = 0.55
+    event(m, "state", ["text": "draft hello!", "caret": 12])
+    m.settleAttempt(testEvent: true)
+    expect(!valid(m) && !delivered(m), "fresh snapshot still detects edits while AX value was cached")
+    print("monitor checks=\(checks)"); exit(0)
+}
 if ["window-after-settle", "window-during-buffer", "window-before-observation"].contains(selectedRule ?? "") {
     let m = make(requirePaste: true)
     event(m, "state", ["pid": 4242, "text": "draft ", "caret": 6])
@@ -544,8 +684,15 @@ for departure in ["deactivate", "focus_notification"] {
 do {
     let m = make(); arm(m)
     event(m, "unnotified_state", ["caret": 4])
+    expect(!valid(m), "caret movement observed while original remains focused cancels")
     event(m, "deactivate")
-    expect(!m.sentAwaitingReport, "departure cannot send an unobserved caret edit")
+    expect(!m.sentAwaitingReport, "departure cannot revive a confirmed caret edit")
+}
+do {
+    let m = make(); arm(m)
+    event(m, "unnotified_state", ["caret": 4])
+    event(m, "deactivate")
+    expect(m.sentAwaitingReport, "after confirmed blur a changed selection alone is not proof of editing")
 }
 // Text can be temporarily unreadable while identity is still confirmed. A
 // temporarily unreadable focus identity is not itself proof of editing.
@@ -644,7 +791,8 @@ print("monitor checks=\(checks)")
                                       capture_output=True, text=True, timeout=120)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
             (root / "events.jsonl").touch()
-            for rule in ("all", "window-after-settle", "window-during-buffer", "window-before-observation"):
+            for rule in ("all", "window-after-settle", "window-during-buffer", "window-before-observation",
+                         "settlement-cache", "settlement-delivery", "settlement-expiry", "settlement-autoretry", "settlement-epoch", "settlement-edited"):
                 with self.subTest(rule=rule):
                     result = subprocess.run([binary, str(root / "events.jsonl"), rule],
                                             capture_output=True, text=True, timeout=30)

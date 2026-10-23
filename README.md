@@ -62,16 +62,16 @@ typeless-autosend delay reset --app com.mitchellh.ghostty
 
 The default delay is **1 second**. Nonnegative fractional seconds are supported. An app override takes precedence; resetting it makes that app follow the global value again. Global `delay reset` restores 1 second.
 
-A fixed 150 ms paste buffer comes before the configured delay. A value of `0` removes the extra waiting period, not that buffer. Timing starts when the database completion is detected; Typeless has no official completion hook and this is not proof that pasting has finished.
+A fixed 150 ms paste buffer comes before the configured delay. A value of `0` removes the extra waiting period, not that buffer. Timing starts when the database completion is detected; Typeless has no official completion hook and this is not proof that pasting has finished. If Accessibility still reports the pre-paste value, settlement retries within a bounded window instead of immediately treating the cached value as a failed paste. Delivery waits for settlement, including with a zero delay.
 
 ## Focus changes and cancellation
 
 These rules apply only after a new Typeless completion schedules an automatic send in an enabled application. Ordinary typing without a pending send never causes Return.
 
 - The service captures the original input immediately before Typeless pastes. After the 150 ms paste buffer, it identifies the lines containing the pasted text using the insertion point or the change between the before/after snapshots. If it cannot locate those lines, it compares the whole input instead.
-- Changes to the tracked lines cancel permanently. Refreshes elsewhere in a screen-sized input do not cancel a located region. Caret or selection changes also cancel when the application reports them. These checks run while the original application is frontmost.
+- Changes to the tracked lines cancel permanently. Refreshes elsewhere in a screen-sized input do not cancel a located region. Caret or selection changes also cancel while the original input is still focused and reports them. Selection resets caused by losing focus do not count as editing.
 - Keyboard events alone do not cancel or send. Clicking inside the original input keeps the countdown unless its content or selection changes. Its Accessibility ancestors and descendants count as the same input.
-- After the paste buffer, a confirmed outside click in the original application posts Return before the event-tap callback releases the click. The destination can be another input, a button or blank space. An uncertain Accessibility relationship does not trigger an early send.
+- After the paste buffer, a confirmed outside click in the original application posts Return before the event-tap callback releases the click. The destination can be another input, a button or blank space. Separate branches under a known shared Accessibility ancestor prove that two controls are outside each other; unreadable ancestors above that point do not block this decision. An uncertain relationship does not trigger an early send.
 - Switching to another window or input in the same application sends immediately to the original PID. Switching to another application or desktop also sends to the original PID without activating it. Departure compares the captured original input rather than the newly focused input; confirmed content or caret editing still cancels.
 - Leaving during the paste buffer queues the send until the buffer finishes and the original input's baseline is established. A completed focus change does not cancel that queued departure.
 - Unreadable focus identity or text alone is not treated as editing. Expiry does not reread text or selection. See [implementation notes](docs/implementation-notes-leave-to-send.md) for the unit-test verification boundary of PID delivery.

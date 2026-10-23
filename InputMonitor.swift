@@ -74,6 +74,7 @@ final class InputMonitor {
     private let eventPath: String?
     private let manualTestSettlement: Bool
     private let requirePasteCapture: Bool
+    private let settlementNow: () -> TimeInterval
     private var eventOffset = 0
     // All attempt/tap state is shared with the dedicated event thread. Callbacks
     // consume the attempt synchronously; reporting to the main loop is asynchronous.
@@ -96,19 +97,28 @@ final class InputMonitor {
     private var eventThread: Thread?
     private var eventRunLoop: CFRunLoop?
     private var authorizeSend: (() -> Bool)?
+    private static let settlementTimeout: TimeInterval = 1
+    private static let settlementRetryInterval: TimeInterval = 0.05
     private var settled = false
+    private var settlementDeadline: TimeInterval = 0
+    private var settlementRetryScheduled = false
+    private var settlementWaitKind: String?
+    private struct Departure {
+        var reason: String
+        var focusChanged: Bool
+    }
     private struct PasteCapture {
         var generation: Int
         var focus: FocusSnapshot
         var recordID: String?
         var capturedAt: TimeInterval
-        var departed = false
+        var departure: Departure?
     }
     private var pasteCapture: PasteCapture?
     private var consumedPaste: PasteCapture?
     private var pasteBaseline: PasteBaseline?
     private var pastedText = ""
-    private var pendingDeparture: String?
+    private var pendingDeparture: Departure?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var simulatedProcessAlive = true
     private var simulatedAccessibilityTrusted = true
@@ -193,8 +203,10 @@ final class InputMonitor {
     var onFocusChange: ((String) -> Void)?
     var onMonitoringChange: ((String) -> Void)?
 
-    init(dryRun: Bool, environment: [String: String]) {
+    init(dryRun: Bool, environment: [String: String],
+         settlementNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.dryRun = dryRun
+        self.settlementNow = settlementNow
         requirePasteCapture = !dryRun || environment["TYPELESS_TEST_REQUIRE_PASTE"] == "1"
         manualTestSettlement = dryRun && environment["TYPELESS_TEST_MANUAL_SETTLE"] == "1"
         eventPath = dryRun ? environment["TYPELESS_TEST_EVENTS"] : nil
@@ -320,6 +332,7 @@ final class InputMonitor {
 
     private func cancelFromEvent(_ reason: String) {
         guard attemptActive else { return }
+        let reason = cancellationContext(reason)
         attemptActive = false
         if dryRun { onKeyboard?(reason) }
         else {
@@ -331,6 +344,11 @@ final class InputMonitor {
                 self.onKeyboard?(reason)
             }
         }
+    }
+
+    private func cancellationContext(_ reason: String) -> String {
+        guard let original = armedFocus, !reason.contains(" app=") else { return reason }
+        return "\(reason) app=\(original.bundleID) pid=\(original.processID)"
     }
 
     func handleEvent(_ type: CGEventType, _ event: CGEvent) {
@@ -394,34 +412,50 @@ final class InputMonitor {
         if attemptActive {
             if settled, case .failure = validateAttempt() { return }
             requestDeparture("before-focus-change")
-        } else { pasteCapture?.departed = true }
+        } else {
+            let focusChanged = pasteCapture?.departure?.focusChanged == true
+            pasteCapture?.departure = Departure(reason: "original-pid", focusChanged: focusChanged)
+        }
     }
 
-    // Only a completed ancestry walk can prove that two objects are outside
-    // one another. Missing parents, timeouts, cycles and excessive depth leave
-    // classification unknown; focus/deactivation notifications remain active.
+    // A common ancestor above two separate branches proves separation without
+    // reading ancestors beyond it. Advance both walks so a deep web hierarchy
+    // cannot consume the entire AX budget before inspecting the original side.
     static func classifyInputTarget<Element>(hit: Element, original: Element,
             equal: (Element, Element) -> Bool, parentStep: (Element) -> InputParentStep<Element>,
             maximumDepth: Int = 24) -> InputTargetRelation {
         if equal(hit, original) { return .inside }
-        func ancestry(_ leaf: Element) -> ([Element], Bool) {
-            var nodes: [Element] = []
-            var current = leaf
-            for _ in 0..<maximumDepth {
-                if nodes.contains(where: { equal($0, current) }) { return (nodes, false) }
-                switch parentStep(current) {
-                case .boundary: return (nodes + [current], true)
-                case .unavailable: return (nodes, false)
-                case .parent(let parent): nodes.append(current); current = parent
+        var hitPath: [Element] = [], originalPath: [Element] = []
+        var hitNode: Element? = hit, originalNode: Element? = original
+        var hitComplete = false, originalComplete = false
+        for _ in 0..<maximumDepth {
+            if let node = hitNode {
+                if hitPath.contains(where: { equal($0, node) }) { hitNode = nil }
+                else { hitPath.append(node) }
+            }
+            if let node = originalNode {
+                if originalPath.contains(where: { equal($0, node) }) { originalNode = nil }
+                else { originalPath.append(node) }
+            }
+            if hitPath.contains(where: { equal($0, original) }) || originalPath.contains(where: { equal($0, hit) }) { return .inside }
+            if hitPath.contains(where: { left in originalPath.contains(where: { equal(left, $0) }) }) { return .outside }
+            if let node = hitNode {
+                switch parentStep(node) {
+                case .parent(let parent): hitNode = parent
+                case .boundary: hitNode = nil; hitComplete = true
+                case .unavailable: hitNode = nil
                 }
             }
-            return (nodes, false)
+            if let node = originalNode {
+                switch parentStep(node) {
+                case .parent(let parent): originalNode = parent
+                case .boundary: originalNode = nil; originalComplete = true
+                case .unavailable: originalNode = nil
+                }
+            }
+            if hitNode == nil && originalNode == nil { break }
         }
-        let hitPath = ancestry(hit)
-        if hitPath.0.contains(where: { equal($0, original) }) { return .inside }
-        let originalPath = ancestry(original)
-        if originalPath.0.contains(where: { equal($0, hit) }) { return .inside }
-        return hitPath.1 && originalPath.1 ? .outside : .unknown
+        return hitComplete && originalComplete ? .outside : .unknown
     }
 
     private func classifyInputTarget(_ hit: AXUIElement, _ original: AXUIElement,
@@ -458,7 +492,13 @@ final class InputMonitor {
     }
 
     private func focusHasDeparted(original: FocusSnapshot, focused: FocusSnapshot, deadline: TimeInterval) -> Bool {
-        if original.sameTarget(as: focused) { return false }
+        Self.focusHasDeparted(original: original, focused: focused,
+            inputRelation: focusedInputRelation(original: original, focused: focused, deadline: deadline))
+    }
+
+    private func focusedInputRelation(original: FocusSnapshot, focused: FocusSnapshot, deadline: TimeInterval) -> InputTargetRelation {
+        if original.sameTarget(as: focused) { return .inside }
+        guard original.sameWindow(as: focused) else { return .outside }
         // Distinct dry-run input tokens model separate controls. Native inputs
         // need a completed ancestry walk; an unreadable parent is inconclusive.
         var relation: InputTargetRelation = dryRun ? .outside : .unknown
@@ -466,7 +506,13 @@ final class InputMonitor {
             relation = Self.classifyFocusedInputTarget(focused: input, original: originalInput,
                 equal: { CFEqual($0, $1) }, parentStep: { self.inputParentStep($0, deadline: deadline) })
         }
-        return Self.focusHasDeparted(original: original, focused: focused, inputRelation: relation)
+        return relation
+    }
+
+    private func originalInputIsFocused(_ original: FocusSnapshot, deadline: TimeInterval) -> Bool {
+        guard originalIsFrontmost(original),
+              case .success(let focused) = inspectIdentity(original, deadline: deadline) else { return false }
+        return focusedInputRelation(original: original, focused: focused, deadline: deadline) == .inside
     }
 
     private func capturePaste() {
@@ -501,13 +547,13 @@ final class InputMonitor {
         // A pre-arm departure still belongs to its capture after begin/arm has
         // changed attempt epoch. An older capture cannot mark a newer one left.
         if pasteCapture?.generation == captureGeneration, pasteCapture?.focus.processID == pid {
-            pasteCapture?.departed = true
+            pasteCapture?.departure = Departure(reason: "original-pid", focusChanged: true)
         }
         let consumedMatch = consumedPaste?.generation == captureGeneration && consumedPaste?.focus.processID == pid
         guard epoch == attemptEpoch || consumedMatch else { return }
-        if consumedMatch { consumedPaste?.departed = true }
+        if consumedMatch { consumedPaste?.departure = Departure(reason: "original-pid", focusChanged: true) }
         guard attemptActive, armedFocus?.processID == pid else { return }
-        requestDeparture("original-pid")
+        requestDeparture("original-pid", focusChanged: true)
     }
 
     private func applicationTerminated(pid: pid_t) {
@@ -517,17 +563,24 @@ final class InputMonitor {
         if armedFocus?.processID == pid { cancelFromEvent("original application exited") }
     }
 
-    private func requestDeparture(_ reason: String) {
+    private func requestDeparture(_ reason: String, focusChanged: Bool = false) {
         guard attemptActive else { return }
-        guard settled else { pendingDeparture = reason; return }
+        guard settled else {
+            pendingDeparture = Departure(reason: reason,
+                focusChanged: focusChanged || pendingDeparture?.focusChanged == true)
+            return
+        }
         // An edit can precede its queued AX notification or foreground poll.
         // Take one final snapshot of the captured input object at departure;
         // subsequent background activity is never polled for content changes.
         if let original = armedFocus {
+            // A focus notification/deactivation already proves blur, even when
+            // AXFocusedUIElement briefly keeps returning the previous input.
+            let compareSelection = !focusChanged && originalInputIsFocused(original, deadline: ProcessInfo.processInfo.systemUptime + 0.025)
             let target = dryRun ? (simulatedOriginalFocus ?? original) : original
             if case .success(let current) = inspectInput(target, deadline: ProcessInfo.processInfo.systemUptime + 0.025),
-               contentWasEdited(current, baseline: original) {
-                cancelFromEvent("original content/caret/selection changed")
+               let reason = contentEditReason(current, baseline: original, compareSelection: compareSelection) {
+                cancelFromEvent(reason)
                 return
             }
         }
@@ -598,10 +651,13 @@ final class InputMonitor {
         authorizeSend = authorize
         self.pastedText = pastedText
         pasteBaseline = nil
-        pendingDeparture = consumedPaste?.departed == true ? "original-pid" : nil
-        if !originalIsFrontmost(focus) { pendingDeparture = "original-pid" }
+        pendingDeparture = consumedPaste?.departure
+        if !originalIsFrontmost(focus) { pendingDeparture = Departure(reason: "original-pid", focusChanged: true) }
         missedEvent.store(false, ordering: .releasing)
         settled = false
+        settlementDeadline = settlementNow() + Self.settlementTimeout
+        settlementRetryScheduled = false
+        settlementWaitKind = nil
         sentOnEventThread = false
         returnEvents = [true, false].compactMap { down in
             guard let key = CGEvent(keyboardEventSource: CGEventSource(stateID: .privateState), virtualKey: CGKeyCode(kVK_Return), keyDown: down) else { return nil }
@@ -649,6 +705,9 @@ final class InputMonitor {
         consumedPaste = nil
         pasteBaseline = nil
         pendingDeparture = nil
+        settlementDeadline = 0
+        settlementRetryScheduled = false
+        settlementWaitKind = nil
         if let focusObserver {
             CFRunLoopRemoveSource(eventRunLoop, AXObserverGetRunLoopSource(focusObserver), .commonModes)
         }
@@ -751,24 +810,31 @@ final class InputMonitor {
         return .success(snapshot)
     }
 
-    // Typeless may finish its paste during the existing 150 ms paste buffer.
-    // Freeze content and selection after that buffer, never after user editing.
+    // The first sample follows the 150 ms paste buffer. AX values can remain
+    // cached after visible insertion, so unobserved text gets bounded retries.
+    // Every usable sample still passes the original content/caret edit checks.
     func settleAttempt(testEvent: Bool = false) {
         stateLock.lock(); defer { stateLock.unlock() }
         guard !manualTestSettlement || testEvent else { return }
-        guard attemptActive, let original = armedFocus else { return }
+        guard attemptActive, !settled, let original = armedFocus else { return }
+        if settlementWaitKind != nil, settlementNow() >= settlementDeadline {
+            expireUnobservedPaste()
+            return
+        }
         let target = dryRun ? (simulatedOriginalFocus ?? original) : original
         guard case .success(let current) = inspectInput(target, deadline: ProcessInfo.processInfo.systemUptime + 0.025),
               original.sameTarget(as: current) else {
             cancelFromEvent("cannot settle original input"); return
         }
         if consumedPaste != nil, !pastedText.isEmpty, current.text.isEmpty {
-            cancelFromEvent("no pasted text observed in original input")
+            waitForPastedText(kind: "empty")
             return
         }
         let before = consumedPaste?.focus
         let reportsSelection = before?.selectionAvailable == true && current.selectionAvailable &&
             (before?.selectionStart != 0 || before?.selectionLength != 0 || current.selectionStart != 0 || current.selectionLength != 0)
+        let compareSelection = pendingDeparture?.focusChanged != true &&
+            originalInputIsFocused(original, deadline: ProcessInfo.processInfo.systemUptime + 0.025)
         if let before, !pastedText.isEmpty {
             if before.text == current.text {
                 let text = before.text as NSString
@@ -779,21 +845,25 @@ final class InputMonitor {
                     text.substring(with: NSRange(location: before.selectionStart, length: before.selectionLength)) == pastedText &&
                     !overflow && current.selectionStart == expectedCaret && current.selectionLength == 0
                 guard trustedSameTextReplacement else {
-                    cancelFromEvent("no pasted text observed in original input")
+                    waitForPastedText(kind: "unchanged")
                     return
                 }
+            }
+            guard PasteBaseline.hasPastedTextEvidence(in: current.text, pastedText: pastedText) else {
+                waitForPastedText(kind: "not_observed")
+                return
             }
             if PasteBaseline.settlementWasEdited(beforeText: before.text,
                 insertionStart: reportsSelection ? before.selectionStart : nil,
                 insertionLength: reportsSelection ? before.selectionLength : 0,
                 afterText: current.text, pastedText: pastedText) {
-                cancelFromEvent("original content edited during paste buffer")
+                cancelFromEvent("original content edited during paste buffer kind=content beforeUTF16=\(before.text.utf16.count) afterUTF16=\(current.text.utf16.count) pasteUTF16=\(pastedText.utf16.count)")
                 return
             }
-            if reportsSelection {
+            if reportsSelection && compareSelection {
                 let (expectedCaret, overflow) = before.selectionStart.addingReportingOverflow(pastedText.utf16.count)
                 if overflow || current.selectionStart != expectedCaret || current.selectionLength != 0 {
-                    cancelFromEvent("original caret/selection changed during paste buffer")
+                    cancelFromEvent("original caret/selection changed during paste buffer kind=\(current.selectionLength != 0 ? "selection" : "caret") expected=\(expectedCaret) actual=\(current.selectionStart) length=\(current.selectionLength)")
                     return
                 }
             }
@@ -803,12 +873,39 @@ final class InputMonitor {
             insertionLength: reportsSelection ? before?.selectionLength ?? 0 : 0, afterText: current.text, pastedText: pastedText)
         armedFocus = current
         settled = true
-        if let reason = pendingDeparture { pendingDeparture = nil; requestDeparture(reason) }
+        settlementRetryScheduled = false
+        settlementWaitKind = nil
+        if let departure = pendingDeparture {
+            pendingDeparture = nil
+            requestDeparture(departure.reason, focusChanged: departure.focusChanged)
+        }
         else {
             // Focus may have left between paste capture and observer setup.
             // Settle the captured input first, then detect that departure once.
             _ = validateAttempt()
         }
+    }
+
+    private func waitForPastedText(kind: String) {
+        settlementWaitKind = kind
+        let remaining = settlementDeadline - settlementNow()
+        guard remaining > 0 else { expireUnobservedPaste(); return }
+        // Manual settlement is a deterministic unit-test boundary. Production
+        // retries the saved input object; it never replaces snapshot A or target.
+        guard !manualTestSettlement, !settlementRetryScheduled else { return }
+        settlementRetryScheduled = true
+        let epoch = attemptEpoch
+        DispatchQueue.main.asyncAfter(deadline: .now() + min(Self.settlementRetryInterval, remaining)) { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock(); defer { self.stateLock.unlock() }
+            guard self.attemptEpoch == epoch, self.attemptActive, !self.settled else { return }
+            self.settlementRetryScheduled = false
+            self.settleAttempt()
+        }
+    }
+
+    private func expireUnobservedPaste() {
+        cancelFromEvent("no pasted text observed in original input (kind=\(settlementWaitKind ?? "unsettled"), timeout)")
     }
 
     func validateAttempt(deadline: TimeInterval? = nil) -> Result<FocusSnapshot, InputMonitorError> {
@@ -817,10 +914,14 @@ final class InputMonitor {
             return .failure(InputMonitorError(reason: "attempt already consumed, cancelled or input inspection interrupted"))
         }
         guard settled, originalIsFrontmost(original) else { return .success(original) }
-        if case .success(let identity) = inspectIdentity(original, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025),
-           focusHasDeparted(original: original, focused: identity, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025) {
-            requestDeparture("original-pid")
-            return .success(original)
+        var compareSelection = false
+        if case .success(let identity) = inspectIdentity(original, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025) {
+            let relation = focusedInputRelation(original: original, focused: identity, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025)
+            if Self.focusHasDeparted(original: original, focused: identity, inputRelation: relation) {
+                requestDeparture("original-pid", focusChanged: true)
+                return .success(original)
+            }
+            compareSelection = relation == .inside
         }
         // Identity can be unreadable while the captured input still exposes its
         // content. Continue checking that original object instead of treating
@@ -830,17 +931,26 @@ final class InputMonitor {
         // A text read may fail independently of the focused input's identity.
         // Unknown text is not proof that the protected region was edited.
         guard case .success(let current) = result else { return .success(original) }
-        guard !contentWasEdited(current, baseline: original) else {
-            cancelFromEvent("original content/caret/selection changed")
-            return .failure(InputMonitorError(reason: "original content/caret/selection changed"))
+        if let reason = contentEditReason(current, baseline: original, compareSelection: compareSelection) {
+            let contextualReason = cancellationContext(reason)
+            cancelFromEvent(contextualReason)
+            return .failure(InputMonitorError(reason: contextualReason))
         }
         return .success(current)
     }
 
-    private func contentWasEdited(_ current: FocusSnapshot, baseline original: FocusSnapshot) -> Bool {
-        let selectionChanged = original.selectionAvailable && current.selectionAvailable &&
-            (original.selectionStart != current.selectionStart || original.selectionLength != current.selectionLength)
-        return pasteBaseline?.matches(current.text) == false || selectionChanged
+    private func contentEditReason(_ current: FocusSnapshot, baseline original: FocusSnapshot, compareSelection: Bool) -> String? {
+        if pasteBaseline?.matches(current.text) == false {
+            return "original content/caret/selection changed kind=content beforeUTF16=\(original.text.utf16.count) afterUTF16=\(current.text.utf16.count)"
+        }
+        guard compareSelection, original.selectionAvailable, current.selectionAvailable else { return nil }
+        if original.selectionStart != current.selectionStart {
+            return "original content/caret/selection changed kind=caret before=\(original.selectionStart) after=\(current.selectionStart)"
+        }
+        if original.selectionLength != current.selectionLength {
+            return "original content/caret/selection changed kind=selection before=\(original.selectionLength) after=\(current.selectionLength)"
+        }
+        return nil
     }
 
     func deliver(completion: @escaping (Bool) -> Void) {
@@ -879,6 +989,20 @@ final class InputMonitor {
             // Process it before retrying the timer; the timer itself never reads
             // AX text or selection.
             DispatchQueue.main.async { [self] in scheduleDelivery(epoch: epoch, completion: completion) }
+            return
+        }
+        if epoch == attemptEpoch, attemptActive, !settled {
+            // A short send delay may expire before an application's AX value
+            // reflects the paste. Wait for settlement without rereading content
+            // on the delivery path, and retain the same finite settlement budget.
+            if settlementNow() >= settlementDeadline {
+                expireUnobservedPaste()
+                DispatchQueue.main.async { completion(false) }
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.settlementRetryInterval) { [self] in
+                    scheduleDelivery(epoch: epoch, completion: completion)
+                }
+            }
             return
         }
         let safe = epoch == attemptEpoch && sendNow(reason: "original-pid", report: false)
@@ -965,7 +1089,7 @@ final class InputMonitor {
     private func handleFocusNotification(_ notified: FocusSnapshot) {
         guard attemptActive, let original = armedFocus, originalIsFrontmost(original) else { return }
         if focusHasDeparted(original: original, focused: notified, deadline: ProcessInfo.processInfo.systemUptime + 0.025) {
-            requestDeparture("original-pid")
+            requestDeparture("original-pid", focusChanged: true)
             return
         }
         _ = validateAttempt()
@@ -1079,7 +1203,9 @@ final class InputMonitor {
                     if capture.focus.sameTarget(as: simulatedFocus) { simulatedOriginalFocus = simulatedFocus }
                     else if capture.focus.sameTarget(as: before) {
                         simulatedOriginalFocus = before
-                        if type != "unnotified_state" { pasteCapture?.departed = true }
+                        if type != "unnotified_state" {
+                            pasteCapture?.departure = Departure(reason: "original-pid", focusChanged: true)
+                        }
                     }
                 }
             }

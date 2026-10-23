@@ -56,6 +56,20 @@ var process = original
 process.processID = 4343
 expect(InputMonitor.focusHasDeparted(original: original, focused: process, inputRelation: .inside),
        "a different process cannot be inside the original window")
+// Two independent controls can share a readable parent even when the rest of
+// the browser's AX tree is unavailable. That common ancestor proves separation
+// without requiring both walks to reach a window boundary.
+let partialParents = [1: 20, 3: 20, 4: 1]
+func partialStep(_ element: Int) -> InputParentStep<Int> {
+    if let parent = partialParents[element] { return .parent(parent) }
+    return .unavailable
+}
+expect(InputMonitor.classifyInputTarget(hit: 3, original: 1, equal: ==, parentStep: partialStep) == .outside,
+       "separate composers sharing a known container are outside despite unavailable outer ancestors")
+expect(InputMonitor.classifyFocusedInputTarget(focused: 3, original: 1, equal: ==, parentStep: partialStep) == .outside,
+       "focus on the sibling composer is a departure despite unavailable outer ancestors")
+expect(InputMonitor.classifyInputTarget(hit: 4, original: 1, equal: ==, parentStep: partialStep) == .inside,
+       "a child inside the original composer stays inside an incomplete tree")
 print("focus relationship checks passed")
 ''')
             binary = root / "focus-relationship"

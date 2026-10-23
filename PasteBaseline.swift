@@ -15,6 +15,20 @@ struct PasteBaseline {
     private static let maxAlignmentCells = 2_000_000
     private static let infinity = Int.max / 4
 
+    /// A minimum settlement condition only: matching history is still evidence,
+    /// so region identity remains the responsibility of the existing baseline.
+    static func hasPastedTextEvidence(in text: String, pastedText: String) -> Bool {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !pastedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        let normalizedText = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let normalizedPaste = pastedText.replacingOccurrences(of: "\r\n", with: "\n")
+        let evidence = settlementEvidenceText(normalizedPaste)
+        guard !evidence.isEmpty else { return false }
+        // Only CRLF/LF and one final separator are relaxed. Preserve spaces,
+        // punctuation and every other character exactly as supplied.
+        return (normalizedText as NSString).range(of: evidence, options: .literal).location != NSNotFound
+    }
+
     /// Detect edits before B becomes the baseline. Missing or ambiguous content
     /// is not evidence of an edit; leave those cases to the whole-value fallback.
     static func settlementWasEdited(beforeText: String, insertionStart: Int?, insertionLength: Int = 0,
