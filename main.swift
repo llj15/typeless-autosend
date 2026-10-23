@@ -454,10 +454,10 @@ func clearPendingState() {
 
 func finishPendingSend() {
     guard enterPending, let id = pendingRowID else { return }
-    let reason = inputMonitor.endAttempt()
+    let outcome = inputMonitor.endAttemptOutcome()
     clearPendingState()
-    if let reason { log("\(dryRun ? "would enter" : "enter") id=\(id) destination=\(reason)") }
-    else { recordSkip(id, "attempt cancelled before send reporting") }
+    if let reason = outcome.sentReason { log("\(dryRun ? "would enter" : "enter") id=\(id) destination=\(reason)") }
+    else { recordSkip(id, outcome.cancellationReason ?? "attempt cancelled before send reporting") }
     writeRuntimeStatus()
 }
 
@@ -465,12 +465,12 @@ func cancelPending(_ reason: String) {
     guard enterPending, let id = pendingRowID else { return }
     // Atomically disarm or consume the send result. The event thread cannot
     // deliver an old timer between our decision and cancellation.
-    let sentReason = inputMonitor.endAttempt()
+    let outcome = inputMonitor.endAttemptOutcome()
     clearPendingState()
-    if let sentReason {
+    if let sentReason = outcome.sentReason {
         log("\(dryRun ? "would enter" : "enter") id=\(id) destination=\(sentReason)")
         writeRuntimeStatus()
-    } else { recordSkip(id, reason) }
+    } else { recordSkip(id, outcome.cancellationReason ?? reason) }
 }
 inputMonitor.onKeyboard = cancelPending
 inputMonitor.onFocusChange = cancelPending

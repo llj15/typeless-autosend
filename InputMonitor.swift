@@ -35,6 +35,150 @@ struct FocusSnapshot {
 }
 
 struct InputMonitorError: Error { let reason: String }
+struct InputAttemptOutcome { let sentReason: String?; let cancellationReason: String? }
+
+enum InputEventRoute {
+    case process(pid_t)
+    case tap(CGEventTapProxy?)
+    case session
+}
+
+func markInputEvent(_ event: CGEvent, _ marker: Int64,
+                            sourceFactory: (CGEvent) -> CGEventSource? = { CGEventSource(event: $0) }) {
+    // Replacing the source updates metadata even after CoreGraphics cached a
+    // previous userData value. Integer-field mutation alone can keep the old one.
+    if let source = sourceFactory(event) ?? CGEventSource(stateID: .privateState) {
+        source.userData = marker
+        event.setSource(source)
+    } else { event.setIntegerValueField(.eventSourceUserData, value: marker) }
+}
+
+// The input gate has its own lock so an AX/state-lock read cannot lose the
+// second half of a held gesture. Once a mouse-down is held,
+// every following input stays behind it until replay or a finite fail-open.
+private final class InputClickOrder {
+    struct Owner { var epoch: Int?; let generation: Int }
+    enum Phase { case waiting, carrier, claimed, releasing }
+    struct Held { let serial: Int64; var owner: Owner; let deadline: TimeInterval; var events: [CGEvent]; var phase: Phase }
+    static let replayMarker: Int64 = 0x545950454C455353
+    static let carrierPrefix: Int64 = 0x434C494300000000
+    private let lock = NSRecursiveLock()
+    private var nextSerial: Int64 = 0
+    private var held: Held?
+    private var failure: (Owner, String)?
+    var scheduleReplay: ((@escaping () -> Void) -> Void)?
+    var prepareReplay: ((CGEvent) -> Void)?
+    static let limit = 256
+    static func isCarrier(_ event: CGEvent) -> Bool {
+        event.getIntegerValueField(.eventSourceUserData) & ~0xFFFFFFFF == carrierPrefix
+    }
+    var isHolding: Bool { lock.lock(); defer { lock.unlock() }; return held != nil }
+    func failureReason(epoch: Int, generation: Int) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard let (owner, reason) = failure else { return nil }
+        return owner.epoch == epoch || (generation > 0 && owner.generation == generation) ? reason : nil
+    }
+    func begin(_ event: CGEvent, owner: Owner, deadline: TimeInterval) -> Int64? {
+        lock.lock(); defer { lock.unlock() }
+        guard held == nil, let copy = event.copy() else { return nil }
+        nextSerial = (nextSerial + 1) & 0xFFFFFFFF
+        if nextSerial == 0 { nextSerial = 1 }
+        held = Held(serial: nextSerial, owner: owner, deadline: deadline, events: [copy], phase: .waiting)
+        return nextSerial
+    }
+    func append(_ event: CGEvent, post: @escaping ([CGEvent]) -> Void) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard held != nil else { return false }
+        if let current = held, current.events.count >= Self.limit {
+            // A later physical callback proves the claimed-down callback has
+            // returned. Drain before letting this next event through.
+            if current.phase == .claimed { finish(current.serial, post: post) }
+            else { drainRelease(current.serial, post: post) }
+            return false
+        }
+        guard let copy = event.copy() else { release("cannot copy held input", post: post); return false }
+        held!.events.append(copy)
+        if held!.events.count >= Self.limit { release("held input queue limit exceeded", post: post) }
+        return true
+    }
+    func adopt(epoch: Int, generation: Int, post: @escaping ([CGEvent]) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = held else { return }
+        if current.owner.epoch == nil, generation > 0, current.owner.generation == generation {
+            held!.owner.epoch = epoch
+        } else if current.owner.epoch != epoch { release("held input belongs to an ended attempt", post: post) }
+    }
+    func requestCarrier(epoch: Int, generation: Int, post: @escaping ([CGEvent]) -> Void) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = held else { return false }
+        guard current.owner.epoch == epoch, current.owner.generation == generation else { return true }
+        guard current.phase == .waiting else { return true }
+        held!.phase = .carrier
+        postCarrier(serial: current.serial, post: post)
+        return true
+    }
+    private func postCarrier(serial: Int64, post: @escaping ([CGEvent]) -> Void) {
+        // A null carrier cannot click if the event tap disappears before ack.
+        guard let event = CGEvent(source: nil) else { release("cannot create replay carrier", post: post); return }
+        event.type = .null
+        markInputEvent(event, Self.carrierPrefix | serial)
+        post([event])
+    }
+    func retryCarrier(serial: Int64, post: @escaping ([CGEvent]) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard held?.serial == serial, held?.phase == .carrier else { return }
+        postCarrier(serial: serial, post: post)
+    }
+    func claim(_ event: CGEvent, now: TimeInterval, post: @escaping ([CGEvent]) -> Void,
+               send: (Owner) -> Bool) -> (Int64, CGEvent)? {
+        lock.lock(); defer { lock.unlock() }
+        let serial = event.getIntegerValueField(.eventSourceUserData) & 0xFFFFFFFF
+        guard let current = held, current.serial == serial, current.phase == .carrier else { return nil }
+        guard now < current.deadline else { release("held input wait expired", post: post); return nil }
+        // Claim before emission. Timeout/endAttempt can never replay this down twice.
+        held!.phase = .claimed
+        guard send(current.owner) else { held!.phase = .carrier; release("held input send cancelled", post: post); return nil }
+        let first = current.events[0]
+        prepare(first)
+        return (serial, first)
+    }
+    func finish(_ serial: Int64, post: @escaping ([CGEvent]) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = held, current.serial == serial, current.phase == .claimed else { return }
+        held = nil
+        let events = Array(current.events.dropFirst())
+        for event in events { prepare(event) }
+        if !events.isEmpty { post(events) }
+    }
+    func expire(now: TimeInterval, serial: Int64? = nil, post: @escaping ([CGEvent]) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = held, serial == nil || current.serial == serial, now >= current.deadline else { return }
+        release("held input wait expired", post: post)
+    }
+    func release(_ reason: String?, post: @escaping ([CGEvent]) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = held else { return }
+        // A claimed down is being returned by a callback. Only its event-thread
+        // continuation may release the tail, after that callback has returned.
+        guard current.phase != .claimed, current.phase != .releasing else { return }
+        if let reason { failure = (current.owner, reason) }
+        held!.phase = .releasing
+        let drain = { [self] in drainRelease(current.serial, post: post) }
+        if let scheduleReplay { scheduleReplay(drain) } else { drain() }
+    }
+    private func drainRelease(_ serial: Int64, post: @escaping ([CGEvent]) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = held, current.serial == serial, current.phase == .releasing else { return }
+        let events = current.events
+        for event in events { prepare(event) }
+        if !events.isEmpty { post(events) }
+        held = nil
+    }
+    private func prepare(_ event: CGEvent) {
+        if let prepareReplay { prepareReplay(event) }
+        else { markInputEvent(event, Self.replayMarker) }
+    }
+}
 
 struct InputObservationToken: Hashable { let observerID: UInt; let epoch: Int }
 
@@ -75,6 +219,12 @@ final class InputMonitor {
     private let manualTestSettlement: Bool
     private let requirePasteCapture: Bool
     private let settlementNow: () -> TimeInterval
+    private let eventPoster: ((InputEventRoute, [CGEvent]) -> Void)?
+    private let eventSourceFactory: (CGEvent) -> CGEventSource?
+    private let clickOrder = InputClickOrder()
+    private var callbackDeliveryRoute: InputEventRoute?
+    private var firstCancellationReason: String?
+    private let deferCancelReport: Bool
     private var eventOffset = 0
     // All attempt/tap state is shared with the dedicated event thread. Callbacks
     // consume the attempt synchronously; reporting to the main loop is asynchronous.
@@ -138,6 +288,15 @@ final class InputMonitor {
         return returnEvents.map { $0.getIntegerValueField(.eventTargetUnixProcessID) }
     }
     private static let eventMarker: Int64 = 0x545950454C455353
+    private static let replayedPastePrefix: Int64 = 0x5459505000000000
+    private struct ReplayPasteTicket {
+        let epoch: Int
+        let generation: Int
+        let expiresAt: TimeInterval
+    }
+    private let replayTicketLock = NSLock()
+    private var replayTickets: [Int64: ReplayPasteTicket] = [:]
+    private var replayTicketSequence: Int64 = 0
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
     private var focusObserver: AXObserver?
@@ -204,9 +363,14 @@ final class InputMonitor {
     var onMonitoringChange: ((String) -> Void)?
 
     init(dryRun: Bool, environment: [String: String],
-         settlementNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         settlementNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         eventPoster: ((InputEventRoute, [CGEvent]) -> Void)? = nil,
+         eventSourceFactory: @escaping (CGEvent) -> CGEventSource? = { CGEventSource(event: $0) }) {
         self.dryRun = dryRun
         self.settlementNow = settlementNow
+        self.eventPoster = eventPoster
+        self.eventSourceFactory = eventSourceFactory
+        deferCancelReport = dryRun && environment["TYPELESS_TEST_DEFER_CANCEL_REPORT"] == "1"
         requirePasteCapture = !dryRun || environment["TYPELESS_TEST_REQUIRE_PASTE"] == "1"
         manualTestSettlement = dryRun && environment["TYPELESS_TEST_MANUAL_SETTLE"] == "1"
         eventPath = dryRun ? environment["TYPELESS_TEST_EVENTS"] : nil
@@ -215,6 +379,8 @@ final class InputMonitor {
         if dryRun, let pid = environment["TYPELESS_TEST_TYPELESS_PID"].flatMap(Int32.init) {
             verifiedTypelessPIDs = [pid]
         }
+        clickOrder.scheduleReplay = { [weak self] action in self?.afterTapCallback(action) }
+        clickOrder.prepareReplay = { [weak self] event in self?.prepareReplayEvent(event) }
         if !dryRun {
             eventThread = Thread { [weak self] in
                 guard let self else { return }
@@ -255,17 +421,19 @@ final class InputMonitor {
             return
         }
         guard CGPreflightListenEventAccess() else { return }
-        let mask = [CGEventType.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp,
-                    .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp].reduce(CGEventMask(0)) {
+        let mask = [CGEventType.null, .keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp,
+                    .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
+                    .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel].reduce(CGEventMask(0)) {
             $0 | (CGEventMask(1) << $1.rawValue)
         }
         let context = Unmanaged.passUnretained(self).toOpaque()
         tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-            options: .defaultTap, eventsOfInterest: mask, callback: { _, type, event, context in
-                if let context {
-                    Unmanaged<InputMonitor>.fromOpaque(context).takeUnretainedValue().handleEvent(type, event)
-                }
-                return Unmanaged.passUnretained(event)
+            options: .defaultTap, eventsOfInterest: mask, callback: { proxy, type, event, context in
+                guard let context else { return Unmanaged.passUnretained(event) }
+                let monitor = Unmanaged<InputMonitor>.fromOpaque(context).takeUnretainedValue()
+                guard let output = monitor.handleTapEvent(type, event, proxy: proxy) else { return nil }
+                // CoreGraphics releases a replacement event after the callback.
+                return output === event ? Unmanaged.passUnretained(event) : Unmanaged.passRetained(output)
             }, userInfo: context)
         guard let tap, let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else { return }
         tapSource = source
@@ -333,8 +501,10 @@ final class InputMonitor {
     private func cancelFromEvent(_ reason: String) {
         guard attemptActive else { return }
         let reason = cancellationContext(reason)
+        if firstCancellationReason == nil { firstCancellationReason = reason }
         attemptActive = false
-        if dryRun { onKeyboard?(reason) }
+        releaseHeldInput(reason)
+        if dryRun && !deferCancelReport { onKeyboard?(reason) }
         else {
             let epoch = attemptEpoch
             DispatchQueue.main.async { [weak self] in
@@ -351,7 +521,153 @@ final class InputMonitor {
         return "\(reason) app=\(original.bundleID) pid=\(original.processID)"
     }
 
-    func handleEvent(_ type: CGEventType, _ event: CGEvent) {
+    func handleTapEvent(_ type: CGEventType, _ event: CGEvent, proxy: CGEventTapProxy? = nil,
+                        mouseTarget: InputTargetRelation? = nil) -> CGEvent? {
+        let marker = event.getIntegerValueField(.eventSourceUserData)
+        if marker & ~0xFFFFFFFF == Self.replayedPastePrefix {
+            // Replayed Typeless paste belongs to the focus observed when it
+            // actually leaves this tap, after the earlier held mouse-down.
+            replayTicketLock.lock()
+            let ticket = replayTickets.removeValue(forKey: marker)
+            replayTicketLock.unlock()
+            guard let ticket, ticket.expiresAt > settlementNow(),
+                  ticket.generation == publishedPasteGeneration.load(ordering: .acquiring) else { return event }
+            guard stateLock.try() else { missedPasteCapture.store(true, ordering: .releasing); return event }
+            defer { stateLock.unlock() }
+            // Ending the old attempt does not invalidate the user's next
+            // queued paste. A newly armed epoch or newer paste does.
+            guard ticket.epoch == attemptEpoch || (!attemptActive && attemptEpoch == ticket.epoch + 1) else { return event }
+            capturePaste()
+            return event
+        }
+        if event.getIntegerValueField(.eventSourceUserData) == Self.eventMarker { return event }
+        if InputClickOrder.isCarrier(event) {
+            guard stateLock.try() else {
+                let serial = event.getIntegerValueField(.eventSourceUserData) & 0xFFFFFFFF
+                DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(5)) { [weak self] in
+                    self?.clickOrder.retryCarrier(serial: serial) { self?.postEvents($0, route: .session) }
+                }
+                return nil
+            }
+            defer { stateLock.unlock() }
+            let claimed = clickOrder.claim(event, now: settlementNow(), post: { self.postEvents($0, route: .session) }) { owner in
+                guard owner.epoch == attemptEpoch, owner.generation == currentPasteGeneration,
+                      let original = armedFocus else {
+                    cancelFromEvent("held click belongs to an ended attempt")
+                    return false
+                }
+                let frontmost = originalIsFrontmost(original)
+                let focusChanged = !frontmost || originalClickFocusRelation(original) == .outside
+                callbackDeliveryRoute = frontmost ? .tap(proxy) : .process(original.processID)
+                defer { callbackDeliveryRoute = nil }
+                return requestDeparture(frontmost ? "before-focus-change" : "original-pid", focusChanged: focusChanged)
+            }
+            guard let (serial, down) = claimed else { return nil }
+            afterTapCallback { [self] in clickOrder.finish(serial) { self.postEvents($0, route: .session) } }
+            return down
+        }
+        let interrupted = type == .tapDisabledByTimeout || type == .tapDisabledByUserInput
+        if interrupted { releaseHeldInput("input monitoring interrupted") }
+        else if clickOrder.append(event, post: { self.postEvents($0, route: .session) }) {
+            if isVerifiedPaste(type, event) { releaseHeldInput("new Typeless paste while click was held") }
+            return nil
+        }
+        guard [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type) else {
+            handleEvent(type, event)
+            return event
+        }
+        guard stateLock.try() else { missedEvent.store(true, ordering: .releasing); return event }
+        defer { stateLock.unlock() }
+        guard let original = attemptActive ? armedFocus : pasteCapture?.focus,
+              originalIsFrontmost(original) else { return event }
+        let relation: InputTargetRelation
+        if let mouseTarget { relation = mouseTarget }
+        else {
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.025
+            let system = AXUIElementCreateSystemWide()
+            AXUIElementSetMessagingTimeout(system, 0.005)
+            var hit: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(system, Float(event.location.x), Float(event.location.y), &hit) == .success,
+                  let hit else { return event }
+            var pid: pid_t = 0
+            guard AXUIElementGetPid(hit, &pid) == .success, pid == original.processID else { return event }
+            relation = original.input.map { classifyInputTarget(hit, $0, deadline: deadline) } ?? .unknown
+        }
+        guard relation == .outside else { return event }
+        if attemptActive && settled {
+            let focusChanged = originalClickFocusRelation(original) == .outside
+            callbackDeliveryRoute = .tap(proxy)
+            defer { callbackDeliveryRoute = nil }
+            requestDeparture("before-focus-change", focusChanged: focusChanged)
+            return event
+        }
+        let now = settlementNow()
+        let deadline = attemptActive ? min(settlementDeadline, now + Self.settlementTimeout) : now + Self.settlementTimeout
+        let owner = InputClickOrder.Owner(epoch: attemptActive ? attemptEpoch : nil, generation: currentPasteGeneration)
+        guard let serial = clickOrder.begin(event, owner: owner, deadline: deadline) else {
+            if attemptActive { cancelFromEvent("cannot hold outside click") }
+            return event
+        }
+        if attemptActive { pendingDeparture = Departure(reason: "before-focus-change", focusChanged: pendingDeparture?.focusChanged == true) }
+        else {
+            let blurred = pasteCapture?.departure?.focusChanged == true
+            pasteCapture?.departure = Departure(reason: "before-focus-change", focusChanged: blurred)
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + max(0, deadline - now)) { [weak self] in
+            guard let self else { return }
+            self.clickOrder.expire(now: self.settlementNow(), serial: serial) { self.postEvents($0, route: .session) }
+        }
+        return nil
+    }
+
+    private var currentPasteGeneration: Int { consumedPaste?.generation ?? pasteCapture?.generation ?? 0 }
+    private func originalClickFocusRelation(_ original: FocusSnapshot) -> InputTargetRelation {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.025
+        guard case .success(let focused) = inspectIdentity(original, deadline: deadline) else { return .unknown }
+        guard original.sameWindow(as: focused) else { return .outside }
+        return focusedInputRelation(original: original, focused: focused, deadline: deadline)
+    }
+    func isVerifiedPaste(_ type: CGEventType, _ event: CGEvent) -> Bool {
+        type == .keyDown && event.flags.contains(.maskCommand) &&
+            event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_ANSI_V) &&
+            verifiedTypelessPIDs.contains(pid_t(event.getIntegerValueField(.eventSourceUnixProcessID)))
+    }
+    private func afterTapCallback(_ action: @escaping () -> Void) {
+        if dryRun { DispatchQueue.main.async(execute: action) }
+        else if let eventRunLoop {
+            CFRunLoopPerformBlock(eventRunLoop, CFRunLoopMode.commonModes.rawValue, action)
+            CFRunLoopWakeUp(eventRunLoop)
+        }
+    }
+    private func releaseHeldInput(_ reason: String) {
+        clickOrder.release(reason) { self.postEvents($0, route: .session) }
+    }
+    func checkHeldInputTimeout() {
+        clickOrder.expire(now: settlementNow()) { self.postEvents($0, route: .session) }
+    }
+
+    private func prepareReplayEvent(_ event: CGEvent) {
+        // Decide the final marker before changing source metadata. A source
+        // copied from another process's private source can be unavailable.
+        var marker = Self.eventMarker
+        if isVerifiedPaste(event.type, event) {
+            let ticket = ReplayPasteTicket(epoch: publishedAttemptEpoch.load(ordering: .acquiring),
+                generation: publishedPasteGeneration.load(ordering: .acquiring),
+                expiresAt: settlementNow() + 2)
+            replayTicketLock.lock()
+            replayTickets = replayTickets.filter { $0.value.expiresAt > settlementNow() }
+            if replayTickets.count < InputClickOrder.limit {
+                replayTicketSequence = (replayTicketSequence + 1) & 0xFFFFFFFF
+                if replayTicketSequence == 0 { replayTicketSequence = 1 }
+                marker = Self.replayedPastePrefix | replayTicketSequence
+                replayTickets[marker] = ticket
+            }
+            replayTicketLock.unlock()
+        }
+        markInputEvent(event, marker, sourceFactory: eventSourceFactory)
+    }
+
+    func handleEvent(_ type: CGEventType, _ event: CGEvent, mouseTarget: InputTargetRelation? = nil) {
         if event.getIntegerValueField(.eventSourceUserData) == Self.eventMarker { return }
         let keyboard = [.keyDown, .keyUp, .flagsChanged].contains(type)
         let pasteChord = type == .keyDown &&
@@ -390,6 +706,7 @@ final class InputMonitor {
             return
         }
         guard mouseDown, originalIsFrontmost(original) else { return }
+        if let mouseTarget { handleMouseTarget(mouseTarget, hitPID: original.processID); return }
         let deadline = ProcessInfo.processInfo.systemUptime + 0.025
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, 0.005)
@@ -516,12 +833,14 @@ final class InputMonitor {
     }
 
     private func capturePaste() {
+        releaseHeldInput("new Typeless paste")
         let generation = publishedPasteGeneration.load(ordering: .acquiring) &+ 1
         publishedPasteGeneration.store(generation, ordering: .releasing)
         missedPasteCapture.store(false, ordering: .releasing)
         pasteCapture = nil
         guard available, case .success(let snapshot) = currentFocus() else { return }
-        pasteCapture = PasteCapture(generation: generation, focus: snapshot, recordID: pasteRecordIDProvider?(), capturedAt: ProcessInfo.processInfo.systemUptime)
+        pasteCapture = PasteCapture(generation: generation, focus: snapshot,
+            recordID: pasteRecordIDProvider?(), capturedAt: ProcessInfo.processInfo.systemUptime)
     }
 
     private func originalIsFrontmost(_ original: FocusSnapshot) -> Bool {
@@ -563,12 +882,13 @@ final class InputMonitor {
         if armedFocus?.processID == pid { cancelFromEvent("original application exited") }
     }
 
-    private func requestDeparture(_ reason: String, focusChanged: Bool = false) {
-        guard attemptActive else { return }
+    @discardableResult
+    private func requestDeparture(_ reason: String, focusChanged: Bool = false) -> Bool {
+        guard attemptActive else { return false }
         guard settled else {
             pendingDeparture = Departure(reason: reason,
                 focusChanged: focusChanged || pendingDeparture?.focusChanged == true)
-            return
+            return false
         }
         // An edit can precede its queued AX notification or foreground poll.
         // Take one final snapshot of the captured input object at departure;
@@ -581,13 +901,17 @@ final class InputMonitor {
             if case .success(let current) = inspectInput(target, deadline: ProcessInfo.processInfo.systemUptime + 0.025),
                let reason = contentEditReason(current, baseline: original, compareSelection: compareSelection) {
                 cancelFromEvent(reason)
-                return
+                return false
             }
         }
-        _ = sendNow(reason: reason)
+        return sendNow(reason: reason)
     }
 
     private func healthyForSend() -> Bool {
+        if let reason = clickOrder.failureReason(epoch: attemptEpoch, generation: currentPasteGeneration) {
+            cancelFromEvent(reason)
+            return false
+        }
         guard attemptActive, available, !observedMonitoringGap,
               !missedEvent.load(ordering: .acquiring), let original = armedFocus else { return false }
         if dryRun { return simulatedProcessAlive && simulatedAccessibilityTrusted }
@@ -601,14 +925,13 @@ final class InputMonitor {
             cancelFromEvent("original application or send authorization unavailable")
             return false
         }
+        if callbackDeliveryRoute == nil,
+           clickOrder.requestCarrier(epoch: attemptEpoch, generation: currentPasteGeneration,
+               post: { self.postEvents($0, route: .session) }) { return false }
         attemptActive = false
         sentOnEventThread = true
         lastSendReason = reason
-        if !dryRun {
-            for key in returnEvents {
-                key.postToPid(original.processID)
-            }
-        }
+        postEvents(returnEvents, route: callbackDeliveryRoute ?? .process(original.processID))
         guard report else { return true }
         if dryRun { onSent?(reason) }
         else {
@@ -621,6 +944,18 @@ final class InputMonitor {
             }
         }
         return true
+    }
+
+    private func postEvents(_ events: [CGEvent], route: InputEventRoute) {
+        if let eventPoster { eventPoster(route, events); return }
+        guard !dryRun else { return }
+        for event in events {
+            switch route {
+            case .process(let pid): event.postToPid(pid)
+            case .tap(let proxy): event.tapPostEvent(proxy)
+            case .session: event.post(tap: .cgSessionEventTap)
+            }
+        }
     }
 
     private func monitoringInterrupted(_ reason: String) {
@@ -648,6 +983,7 @@ final class InputMonitor {
 
     func armAttempt(focus: FocusSnapshot, pastedText: String = "", authorize: @escaping () -> Bool) {
         stateLock.lock(); defer { stateLock.unlock() }
+        firstCancellationReason = nil
         authorizeSend = authorize
         self.pastedText = pastedText
         pasteBaseline = nil
@@ -670,6 +1006,7 @@ final class InputMonitor {
         publishedAttemptEpoch.store(attemptEpoch, ordering: .releasing)
         attemptActive = true
         armedFocus = focus
+        clickOrder.adopt(epoch: attemptEpoch, generation: currentPasteGeneration) { self.postEvents($0, route: .session) }
         if dryRun, focus.sameTarget(as: simulatedFocus) { simulatedOriginalFocus = simulatedFocus }
         else if simulatedOriginalFocus?.sameTarget(as: focus) != true { simulatedOriginalFocus = focus }
         if dryRun, originalIsFrontmost(focus) { simulatedOriginalApplicationFocus = simulatedFocus }
@@ -691,10 +1028,17 @@ final class InputMonitor {
 
     @discardableResult
     func endAttempt() -> String? {
+        endAttemptOutcome().sentReason
+    }
+
+    @discardableResult
+    func endAttemptOutcome() -> InputAttemptOutcome {
         stateLock.lock(); defer { stateLock.unlock() }
         // Cancellation and observing a completed send are one atomic operation.
         // A queued timer cannot post between the caller's decision and disarm.
-        let outcome = sentOnEventThread ? lastSendReason : nil
+        let outcome = InputAttemptOutcome(sentReason: sentOnEventThread ? lastSendReason : nil,
+            cancellationReason: firstCancellationReason)
+        releaseHeldInput("attempt ended")
         authorizeSend = nil
         sentOnEventThread = false
         returnEvents = []
@@ -708,6 +1052,7 @@ final class InputMonitor {
         settlementDeadline = 0
         settlementRetryScheduled = false
         settlementWaitKind = nil
+        firstCancellationReason = nil
         if let focusObserver {
             CFRunLoopRemoveSource(eventRunLoop, AXObserverGetRunLoopSource(focusObserver), .commonModes)
         }
@@ -723,6 +1068,8 @@ final class InputMonitor {
         let result: Result<FocusSnapshot, InputMonitorError>
         if missedPasteCapture.exchange(false, ordering: .acquiringAndReleasing) { pasteCapture = nil }
         if let capture = pasteCapture, ProcessInfo.processInfo.systemUptime - capture.capturedAt > 10 { pasteCapture = nil }
+        if let capture = pasteCapture,
+           clickOrder.failureReason(epoch: attemptEpoch, generation: capture.generation) != nil { pasteCapture = nil }
         if let capture = pasteCapture, pasteRecordIDProvider == nil || (recordID != nil && capture.recordID == recordID) {
             pasteCapture = nil
             consumedPaste = capture
@@ -911,7 +1258,7 @@ final class InputMonitor {
     func validateAttempt(deadline: TimeInterval? = nil) -> Result<FocusSnapshot, InputMonitorError> {
         stateLock.lock(); defer { stateLock.unlock() }
         guard healthyForSend(), let original = armedFocus else {
-            return .failure(InputMonitorError(reason: "attempt already consumed, cancelled or input inspection interrupted"))
+            return .failure(InputMonitorError(reason: firstCancellationReason ?? "attempt already consumed, cancelled or input inspection interrupted"))
         }
         guard settled, originalIsFrontmost(original) else { return .success(original) }
         var compareSelection = false
@@ -1002,6 +1349,13 @@ final class InputMonitor {
                 DispatchQueue.main.asyncAfter(deadline: .now() + Self.settlementRetryInterval) { [self] in
                     scheduleDelivery(epoch: epoch, completion: completion)
                 }
+            }
+            return
+        }
+        if epoch == attemptEpoch, attemptActive, clickOrder.isHolding {
+            _ = sendNow(reason: "before-focus-change")
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.settlementRetryInterval) { [self] in
+                scheduleDelivery(epoch: epoch, completion: completion)
             }
             return
         }

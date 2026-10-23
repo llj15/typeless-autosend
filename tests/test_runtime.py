@@ -601,6 +601,27 @@ class Runtime(unittest.TestCase):
         self.assertEqual(self.text().count("would enter id=composer-blur "), 1)
         self.assertNotIn("skip id=composer-blur ", self.text())
 
+    def test_deferred_cancellation_preserves_first_cause_in_daemon_log(self):
+        self.configure(delaySeconds=2)
+        self.event("state", text="hello", caret=5)
+        self.start(TYPELESS_TEST_DEFER_CANCEL_REPORT="1")
+        for kind, edit in [("content", {"text": "hello!"}), ("caret", {"caret": 2})]:
+            with self.subTest(kind=kind):
+                self.event("state", text="hello", caret=5)
+                identifier = f"deferred-{kind}"
+                self.complete(identifier)
+                self.wait_pending_file()
+                time.sleep(0.25)
+                self.event("state", **edit)
+                self.wait_for(f"skip id={identifier} ")
+                time.sleep(0.15)
+                lines = [line for line in self.text().splitlines() if f"skip id={identifier} " in line]
+                self.assertEqual(len(lines), 1)
+                self.assertIn(f"kind={kind}", lines[0])
+                self.assertIn(f"app={APP}", lines[0])
+                self.assertNotIn("attempt already consumed", lines[0])
+                self.assertNotIn(f"would enter id={identifier} ", self.text())
+
     def test_removing_app_cancels_pending_permanently(self):
         self.start()
         self.complete("removed")
