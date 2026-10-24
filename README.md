@@ -1,6 +1,6 @@
 # Typeless AutoSend
 
-A macOS command-line utility and login service for Apple Silicon (ARM). After Typeless finishes a transcription, it waits before pressing Return in an application you explicitly enabled. A pending send follows the original input across application switches, with conservative checks before sending.
+A macOS command-line utility and login service for Apple Silicon (ARM). After Typeless finishes a transcription in an enabled application, it sends on application deactivation, an intercepted outside click, or countdown expiry. Editing the pasted text, moving its caret, or an already completed change of input focus cancels that send.
 
 ## Install from a Release (recommended)
 
@@ -62,23 +62,26 @@ typeless-autosend delay reset --app com.mitchellh.ghostty
 
 The default delay is **1 second**. Nonnegative fractional seconds are supported. An app override takes precedence; resetting it makes that app follow the global value again. Global `delay reset` restores 1 second.
 
-A fixed 150 ms paste buffer comes before the configured delay. A value of `0` removes the extra waiting period, not that buffer. Timing starts when the database completion is detected; Typeless has no official completion hook and this is not proof that pasting has finished.
+A fixed 150 ms paste buffer comes before the configured delay. A value of `0` removes the extra waiting period, not that buffer. Timing starts when the database completion is detected; Typeless has no official completion hook and this is not proof that pasting has finished. If Accessibility still reports the pre-paste value, settlement retries within a bounded window instead of immediately treating the cached value as a failed paste. Delivery waits for settlement, including with a zero delay.
 
 ## Focus changes and cancellation
 
 These rules apply only after a new Typeless completion schedules an automatic send in an enabled application. Ordinary typing without a pending send never causes Return.
 
-- Switching to another application keeps the original deadline. At expiry the service checks the original application's PID, AX window, input object, text and selection, then posts Return to that PID without activating it. Keys and text edits in the other application do not cancel the original send.
-- While the original application is still frontmost, a verified left click on a distinct, enabled text field or text area can send before the original click is released. Both controls must have separate Accessibility ancestry ending in a window, and the target must support focus. This also covers another window in the same application when those checks succeed. There is no focus restoration or fixed waiting period.
-- Plain, non-repeated Tab can send first only from an Accessibility single-line `AXTextField` with an ASCII-capable keyboard input source. Multiline/custom editors, IME input sources, modified Tab and uncertain navigation cancel conservatively. Applications can customize Tab behavior; this restricted classification is not a compatibility guarantee.
-- Clicking the original input, buttons, combo boxes, ambiguous composite controls, or an unreadable target cancels. Activating the original application from another application keeps the deadline rather than injecting Return ahead of activation. Programmatic focus changes without a verified intercepted input event cancel.
-- Editing the original input, moving its caret or changing its selection cancels permanently. Physical editing keys, Return/newline, modified navigation and Fn also cancel while the original application is frontmost. Modifier changes alone do not edit text; Command-Tab preserves the countdown.
-- The existing 150 ms paste buffer must finish before an early send is allowed. During it, attributed Typeless paste changes can settle; user editing still cancels. A transition before the buffer ends cancels. Starting another dictation with Fn cancels the old attempt; a later completion can start a new one.
-- Cancellation never resumes when focus returns. Permission loss, Secure Input, missed input during an inspection, unresponsive AX, missing content/selection notifications, app exit or unreadable original state skips the attempt.
+- The service captures the original input immediately before Typeless pastes. After the 150 ms paste buffer, it identifies the lines containing the pasted text using the insertion point or the change between the before/after snapshots. If it cannot locate those lines, it compares the whole input instead.
+- Changes to the tracked lines cancel permanently. Refreshes elsewhere in a screen-sized input do not cancel a located region. Caret or selection changes also cancel while the original input is still focused and reports them. Selection resets caused by losing focus do not count as editing.
+- Keyboard events alone do not cancel or send. Clicking inside the original input keeps the countdown unless its content or selection changes. Its Accessibility ancestors and descendants count as the same input.
+- A confirmed outside click in the original application inserts Return into the same event-tap stream before releasing the click. The destination can be another input, a button or blank space. Separate branches under a known shared Accessibility ancestor prove that two controls are outside each other; unreadable ancestors above that point do not block this decision. An uncertain relationship does not trigger an early send.
+- Focus notifications for a switch to another window or input request immediate Return to the original PID. Application deactivation uses the same PID path without activating it. PID delivery cannot itself select the original control after focus has changed. Intercepted mouse clicks use the ordered click path above. Departure compares the captured original input; confirmed content or caret editing still cancels.
+- A confirmed outside click during paste settlement is temporarily held, together with subsequent key, button, drag and scroll events, so focus stays in the original input. Successful settlement releases Return before the saved click; cancellation or a bounded timeout releases the saved input without Return. A late completion cannot revive a timed-out click. Non-mouse departures retain the existing PID delivery path.
+- Unreadable focus identity or text alone is not treated as editing. Expiry does not reread text or selection. See [implementation notes](docs/implementation-notes-leave-to-send.md) for the unit-test verification boundary of PID delivery.
+- A newer local database record cancels the pending attempt, including a new dictation whose status is still empty. This does not depend on a dictation shortcut.
+- If you stay in the original input, expiry sends without rereading its text or selection. The attempt must still be active and authorized, with a live original process, available permissions and Secure Input off.
+- Cancellation never resumes when focus returns. Pausing, disabling the app, permission loss, Secure Input, a listener interruption or the original app exiting cancels the attempt.
 
-The service uses an active event tap on a dedicated thread. It passes the original switching event through after inserting a single Return pair. AX requests use a 5 ms messaging timeout and an overall 25 ms software check budget; overruns cancel sending. These are **not hard latency bounds**: macOS AX calls and the final config read can take longer, delaying that original event. The service never promises zero added latency.
+The service uses an active event tap on a dedicated thread. Click-triggered Return uses the current tap callback's stream; other departures and expiry retain PID delivery. AX requests use a 5 ms messaging timeout and an overall 25 ms software check budget. These are **not hard latency bounds**: macOS AX calls and the final config read can take longer, delaying an intercepted click.
 
-Accessibility support varies. Both content and selection notifications, readable text and selection ranges are required; applications previously usable with focus-only inspection may now skip. Unsupported controls and uncertain transitions cancel rather than guessing. The automated runtime tests simulate macOS state and never post keys; owned AppKit experiments establish event ordering and background PID delivery only, not compatibility with every chat application.
+Accessibility support varies. Readable input text is needed to establish a baseline; controls without caret information use content alignment. Automated unit tests cover the region algorithm, simulated macOS events and dry-run sends without posting keys. They do not establish compatibility with every real application.
 
 ## Pause and inspect
 
