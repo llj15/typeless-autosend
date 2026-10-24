@@ -57,14 +57,16 @@ func markInputEvent(_ event: CGEvent, _ marker: Int64,
 // second half of a held gesture. Once a mouse-down is held,
 // every following input stays behind it until replay or a finite fail-open.
 private final class InputClickOrder {
-    struct Owner { var epoch: Int?; let generation: Int }
-    enum Phase { case waiting, carrier, claimed, releasing }
+    struct Owner: Equatable { var epoch: Int?; let generation: Int }
+    enum Phase { case classifying, waiting, carrier, claimed, releasing }
     struct Held { let serial: Int64; var owner: Owner; let deadline: TimeInterval; var events: [CGEvent]; var phase: Phase }
     static let replayMarker: Int64 = 0x545950454C455353
     static let carrierPrefix: Int64 = 0x434C494300000000
     private let lock = NSRecursiveLock()
     private var nextSerial: Int64 = 0
     private var held: Held?
+    private var publishedOwner: Owner?
+    var onDiagnostic: ((String) -> Void)?
     private var failure: (Owner, String)?
     var scheduleReplay: ((@escaping () -> Void) -> Void)?
     var prepareReplay: ((CGEvent) -> Void)?
@@ -77,6 +79,35 @@ private final class InputClickOrder {
         lock.lock(); defer { lock.unlock() }
         guard let (owner, reason) = failure else { return nil }
         return owner.epoch == epoch || (generation > 0 && owner.generation == generation) ? reason : nil
+    }
+    var isClassifying: Bool { lock.lock(); defer { lock.unlock() }; return held?.phase == .classifying }
+    func publish(_ owner: Owner?, post: @escaping ([CGEvent]) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        publishedOwner = owner
+        guard let current = held, current.phase == .classifying, current.owner != owner else { return }
+        if current.owner.epoch == nil, let owner, owner.generation > 0, current.owner.generation == owner.generation {
+            held!.owner = owner
+        } else { release("held click target changed before classification", post: post) }
+    }
+    func beginUnclassified(_ event: CGEvent, deadline: TimeInterval) -> (Int64, Owner, CGEvent)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let owner = publishedOwner, let serial = begin(event, owner: owner, deadline: deadline) else { return nil }
+        held!.phase = .classifying
+        return (serial, owner, held!.events[0])
+    }
+    func classificationOwner(_ serial: Int64) -> Owner? {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = held, current.serial == serial, current.phase == .classifying else { return nil }
+        return current.owner
+    }
+    func finishClassification(_ serial: Int64, owner: Owner, outside: Bool, now: TimeInterval,
+                              post: @escaping ([CGEvent]) -> Void) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = held, current.serial == serial, current.owner == owner, current.phase == .classifying else { return false }
+        guard now < current.deadline else { release("held input wait expired", post: post); return false }
+        if outside { held!.phase = .waiting }
+        else { release(nil, post: post) }
+        return true
     }
     func begin(_ event: CGEvent, owner: Owner, deadline: TimeInterval) -> Int64? {
         lock.lock(); defer { lock.unlock() }
@@ -103,6 +134,7 @@ private final class InputClickOrder {
     }
     func adopt(epoch: Int, generation: Int, post: @escaping ([CGEvent]) -> Void) {
         lock.lock(); defer { lock.unlock() }
+        publishedOwner = Owner(epoch: epoch, generation: generation)
         guard let current = held else { return }
         if current.owner.epoch == nil, generation > 0, current.owner.generation == generation {
             held!.owner.epoch = epoch
@@ -110,11 +142,25 @@ private final class InputClickOrder {
     }
     func requestCarrier(epoch: Int, generation: Int, post: @escaping ([CGEvent]) -> Void) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        // A timeout may have released the queue after the caller's health check.
+        // A matching failure must never look like "no queue, send directly".
+        if failureReason(epoch: epoch, generation: generation) != nil { return true }
         guard let current = held else { return false }
         guard current.owner.epoch == epoch, current.owner.generation == generation else { return true }
         guard current.phase == .waiting else { return true }
         held!.phase = .carrier
         postCarrier(serial: current.serial, post: post)
+        return true
+    }
+    func emitOrRequestCarrier(epoch: Int, generation: Int, fromCallback: Bool,
+                              post: @escaping ([CGEvent]) -> Void, emit: () -> Void) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard failureReason(epoch: epoch, generation: generation) == nil else { return false }
+        if !fromCallback, requestCarrier(epoch: epoch, generation: generation, post: post) { return false }
+        // This lock covers only the final event emission, never AX or DB reads.
+        // A contended first-down cannot enter between the no-queue decision and
+        // posting Return, nor be replayed by owner withdrawal ahead of Return.
+        emit()
         return true
     }
     private func postCarrier(serial: Int64, post: @escaping ([CGEvent]) -> Void) {
@@ -162,6 +208,7 @@ private final class InputClickOrder {
         // continuation may release the tail, after that callback has returned.
         guard current.phase != .claimed, current.phase != .releasing else { return }
         if let reason { failure = (current.owner, reason) }
+        onDiagnostic?("click phase=release serial=\(current.serial) epoch=\(current.owner.epoch.map(String.init) ?? "prearm") generation=\(current.owner.generation) reason=\(reason ?? "classification passed through")")
         held!.phase = .releasing
         let drain = { [self] in drainRelease(current.serial, post: post) }
         if let scheduleReplay { scheduleReplay(drain) } else { drain() }
@@ -229,8 +276,8 @@ final class InputMonitor {
     // All attempt/tap state is shared with the dedicated event thread. Callbacks
     // consume the attempt synchronously; reporting to the main loop is asynchronous.
     private let stateLock = NSRecursiveLock()
-    // A busy AX read must never hold up a physical input event. Only a missed
-    // actionable mouse event or real monitoring gap invalidates an attempt.
+    // Tap callbacks never wait for the AX/state mutex. A first mouse-down
+    // uses the independent bounded gate while classification is deferred.
     private let missedEvent = Atomic<Bool>(false)
     private let missedPasteCapture = Atomic<Bool>(false)
     private let publishedPasteGeneration = Atomic<Int>(0)
@@ -266,6 +313,7 @@ final class InputMonitor {
     }
     private var pasteCapture: PasteCapture?
     private var consumedPaste: PasteCapture?
+    private var awaitingArmCapture = false
     private var pasteBaseline: PasteBaseline?
     private var pastedText = ""
     private var pendingDeparture: Departure?
@@ -361,6 +409,7 @@ final class InputMonitor {
     var onKeyboard: ((String) -> Void)?
     var onFocusChange: ((String) -> Void)?
     var onMonitoringChange: ((String) -> Void)?
+    var onDiagnostic: ((String) -> Void)?
 
     init(dryRun: Bool, environment: [String: String],
          settlementNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
@@ -381,6 +430,7 @@ final class InputMonitor {
         }
         clickOrder.scheduleReplay = { [weak self] action in self?.afterTapCallback(action) }
         clickOrder.prepareReplay = { [weak self] event in self?.prepareReplayEvent(event) }
+        clickOrder.onDiagnostic = { [weak self] message in self?.onDiagnostic?(message) }
         if !dryRun {
             eventThread = Thread { [weak self] in
                 guard let self else { return }
@@ -463,6 +513,8 @@ final class InputMonitor {
         if observedMonitoringGap {
             cancelFromEvent("input monitoring unavailable")
             pasteCapture = nil
+            awaitingArmCapture = false
+            publishClickOwner()
             onKeyboard?("input monitoring unavailable: \(state.unavailableReason ?? "interruption observed")")
         }
         reportMonitoringState()
@@ -503,6 +555,8 @@ final class InputMonitor {
         let reason = cancellationContext(reason)
         if firstCancellationReason == nil { firstCancellationReason = reason }
         attemptActive = false
+        awaitingArmCapture = false
+        publishClickOwner()
         releaseHeldInput(reason)
         if dryRun && !deferCancelReport { onKeyboard?(reason) }
         else {
@@ -576,24 +630,19 @@ final class InputMonitor {
             handleEvent(type, event)
             return event
         }
-        guard stateLock.try() else { missedEvent.store(true, ordering: .releasing); return event }
-        defer { stateLock.unlock() }
-        guard let original = attemptActive ? armedFocus : pasteCapture?.focus,
-              originalIsFrontmost(original) else { return event }
-        let relation: InputTargetRelation
-        if let mouseTarget { relation = mouseTarget }
-        else {
-            let deadline = ProcessInfo.processInfo.systemUptime + 0.025
-            let system = AXUIElementCreateSystemWide()
-            AXUIElementSetMessagingTimeout(system, 0.005)
-            var hit: AXUIElement?
-            guard AXUIElementCopyElementAtPosition(system, Float(event.location.x), Float(event.location.y), &hit) == .success,
-                  let hit else { return event }
-            var pid: pid_t = 0
-            guard AXUIElementGetPid(hit, &pid) == .success, pid == original.processID else { return event }
-            relation = original.input.map { classifyInputTarget(hit, $0, deadline: deadline) } ?? .unknown
+        guard stateLock.try() else {
+            let now = settlementNow()
+            guard let (serial, owner, savedEvent) = clickOrder.beginUnclassified(event, deadline: now + Self.settlementTimeout) else { return event }
+            onDiagnostic?("click phase=held result=lock_busy serial=\(serial) epoch=\(owner.epoch.map(String.init) ?? "prearm") generation=\(owner.generation)")
+            retryClickClassification(serial: serial, event: savedEvent, mouseTarget: mouseTarget)
+            scheduleHeldTimeout(serial: serial, deadline: now + Self.settlementTimeout)
+            return nil
         }
-        guard relation == .outside else { return event }
+        defer { stateLock.unlock() }
+        guard let original = clickOriginal, originalIsFrontmost(original) else { return event }
+        let classification = classifyClick(event, original: original, mouseTarget: mouseTarget)
+        onDiagnostic?("click phase=classify result=\(classification.reason) epoch=\(attemptEpoch) generation=\(currentPasteGeneration)")
+        guard classification.relation == .outside else { return event }
         if attemptActive && settled {
             let focusChanged = originalClickFocusRelation(original) == .outside
             callbackDeliveryRoute = .tap(proxy)
@@ -609,18 +658,102 @@ final class InputMonitor {
             return event
         }
         if attemptActive { pendingDeparture = Departure(reason: "before-focus-change", focusChanged: pendingDeparture?.focusChanged == true) }
-        else {
+        else if awaitingArmCapture {
+            let blurred = consumedPaste?.departure?.focusChanged == true
+            consumedPaste?.departure = Departure(reason: "before-focus-change", focusChanged: blurred)
+        } else {
             let blurred = pasteCapture?.departure?.focusChanged == true
             pasteCapture?.departure = Departure(reason: "before-focus-change", focusChanged: blurred)
         }
-        DispatchQueue.global().asyncAfter(deadline: .now() + max(0, deadline - now)) { [weak self] in
-            guard let self else { return }
-            self.clickOrder.expire(now: self.settlementNow(), serial: serial) { self.postEvents($0, route: .session) }
-        }
+        scheduleHeldTimeout(serial: serial, deadline: deadline)
         return nil
     }
 
-    private var currentPasteGeneration: Int { consumedPaste?.generation ?? pasteCapture?.generation ?? 0 }
+    private var clickOriginal: FocusSnapshot? {
+        attemptActive ? armedFocus : (awaitingArmCapture ? consumedPaste?.focus : pasteCapture?.focus)
+    }
+    private var currentPasteGeneration: Int {
+        if attemptActive || awaitingArmCapture { return consumedPaste?.generation ?? pasteCapture?.generation ?? 0 }
+        return pasteCapture?.generation ?? 0
+    }
+    // Called under stateLock. The gate publishes one coherent interest/owner
+    // snapshot without keeping this lock on the event callback's fast path.
+    private func publishClickOwner() {
+        let owner: InputClickOrder.Owner?
+        if attemptActive, armedFocus != nil { owner = .init(epoch: attemptEpoch, generation: currentPasteGeneration) }
+        else if awaitingArmCapture, let capture = consumedPaste { owner = .init(epoch: nil, generation: capture.generation) }
+        else if let capture = pasteCapture { owner = .init(epoch: nil, generation: capture.generation) }
+        else { owner = nil }
+        clickOrder.publish(owner) { self.postEvents($0, route: .session) }
+    }
+    private func scheduleHeldTimeout(serial: Int64, deadline: TimeInterval) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + max(0, deadline - settlementNow())) { [weak self] in
+            guard let self else { return }
+            self.clickOrder.expire(now: self.settlementNow(), serial: serial) { self.postEvents($0, route: .session) }
+        }
+    }
+    private func classifyClick(_ event: CGEvent, original: FocusSnapshot, mouseTarget: InputTargetRelation?) -> (relation: InputTargetRelation, reason: String) {
+        if let mouseTarget { return (mouseTarget, String(describing: mouseTarget)) }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.025
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.005)
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(event.location.x), Float(event.location.y), &hit) == .success,
+              let hit else { return (.unknown, "hit_unavailable") }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(hit, &pid) == .success else { return (.unknown, "hit_pid_unavailable") }
+        guard pid == original.processID else { return (.unknown, "other_app") }
+        let relation = original.input.map { classifyInputTarget(hit, $0, deadline: deadline) } ?? .unknown
+        return (relation, relation == .unknown ? "unknown_ancestry" : String(describing: relation))
+    }
+    private func retryClickClassification(serial: Int64, event: CGEvent, mouseTarget: InputTargetRelation?) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(5)) { [weak self] in
+            self?.afterTapCallback { [weak self] in self?.classifyHeldClick(serial: serial, event: event, mouseTarget: mouseTarget) }
+        }
+    }
+    private func classifyHeldClick(serial: Int64, event: CGEvent, mouseTarget: InputTargetRelation?) {
+        guard clickOrder.classificationOwner(serial) != nil else { return }
+        guard stateLock.try() else { retryClickClassification(serial: serial, event: event, mouseTarget: mouseTarget); return }
+        defer { stateLock.unlock() }
+        guard let owner = clickOrder.classificationOwner(serial), let original = clickOriginal,
+              owner.generation == currentPasteGeneration,
+              (owner.epoch == attemptEpoch && attemptActive || owner.epoch == nil && !attemptActive) else { return }
+        let frontmost = originalIsFrontmost(original)
+        let classification = frontmost ? classifyClick(event, original: original, mouseTarget: mouseTarget) : (relation: InputTargetRelation.unknown, reason: "other_app")
+        let relation = classification.relation
+        onDiagnostic?("click phase=classify result=\(classification.reason) serial=\(serial) epoch=\(owner.epoch.map(String.init) ?? "prearm") generation=\(owner.generation)")
+        // Hit testing does not hold the gate lock: timeout/end may release the
+        // click during an AX read. Commit only if this exact owner is still held.
+        guard clickOrder.finishClassification(serial, owner: owner, outside: relation == .outside,
+                now: settlementNow(), post: { self.postEvents($0, route: .session) }) else { return }
+        if relation == .outside {
+            if attemptActive { requestDeparture("before-focus-change", focusChanged: pendingDeparture?.focusChanged == true) }
+            else if awaitingArmCapture {
+                let blurred = consumedPaste?.departure?.focusChanged == true
+                consumedPaste?.departure = Departure(reason: "before-focus-change", focusChanged: blurred)
+            } else {
+                let blurred = pasteCapture?.departure?.focusChanged == true
+                pasteCapture?.departure = Departure(reason: "before-focus-change", focusChanged: blurred)
+            }
+        } else {
+            // The drain is queued before this continuation. A separate confirmed
+            // departure must survive even though this click itself is inside/unknown.
+            let epoch = attemptEpoch
+            afterTapCallback { [weak self] in self?.resumePendingDeparture(epoch: epoch) }
+        }
+    }
+    private func resumePendingDeparture(epoch: Int) {
+        guard stateLock.try() else {
+            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(5)) { [weak self] in
+                self?.afterTapCallback { [weak self] in self?.resumePendingDeparture(epoch: epoch) }
+            }
+            return
+        }
+        defer { stateLock.unlock() }
+        guard epoch == attemptEpoch, attemptActive, let departure = pendingDeparture else { return }
+        pendingDeparture = nil
+        requestDeparture(departure.reason, focusChanged: departure.focusChanged)
+    }
     private func originalClickFocusRelation(_ original: FocusSnapshot) -> InputTargetRelation {
         let deadline = ProcessInfo.processInfo.systemUptime + 0.025
         guard case .success(let focused) = inspectIdentity(original, deadline: deadline) else { return .unknown }
@@ -688,8 +821,10 @@ final class InputMonitor {
         }
         defer { stateLock.unlock() }
         if interrupted {
+            defer { publishClickOwner() }
             observedMonitoringGap = true
             pasteCapture = nil
+            awaitingArmCapture = false
             cancelFromEvent("input monitoring interrupted")
             return
         }
@@ -833,6 +968,7 @@ final class InputMonitor {
     }
 
     private func capturePaste() {
+        defer { publishClickOwner() }
         releaseHeldInput("new Typeless paste")
         let generation = publishedPasteGeneration.load(ordering: .acquiring) &+ 1
         publishedPasteGeneration.store(generation, ordering: .releasing)
@@ -878,14 +1014,15 @@ final class InputMonitor {
     private func applicationTerminated(pid: pid_t) {
         guard stateLock.try() else { missedEvent.store(true, ordering: .releasing); return }
         defer { stateLock.unlock() }
-        if pasteCapture?.focus.processID == pid { pasteCapture = nil }
+        if pasteCapture?.focus.processID == pid { pasteCapture = nil; publishClickOwner() }
+        if awaitingArmCapture, consumedPaste?.focus.processID == pid { awaitingArmCapture = false; publishClickOwner() }
         if armedFocus?.processID == pid { cancelFromEvent("original application exited") }
     }
 
     @discardableResult
     private func requestDeparture(_ reason: String, focusChanged: Bool = false) -> Bool {
         guard attemptActive else { return false }
-        guard settled else {
+        guard settled, !clickOrder.isClassifying else {
             pendingDeparture = Departure(reason: reason,
                 focusChanged: focusChanged || pendingDeparture?.focusChanged == true)
             return false
@@ -904,7 +1041,11 @@ final class InputMonitor {
                 return false
             }
         }
-        return sendNow(reason: reason)
+        let sent = sendNow(reason: reason)
+        if !sent, attemptActive, clickOrder.isHolding {
+            pendingDeparture = Departure(reason: reason, focusChanged: focusChanged || pendingDeparture?.focusChanged == true)
+        }
+        return sent
     }
 
     private func healthyForSend() -> Bool {
@@ -920,18 +1061,25 @@ final class InputMonitor {
 
     @discardableResult
     private func sendNow(reason: String, report: Bool = true) -> Bool {
+        guard !clickOrder.isClassifying else { return false }
         guard settled, healthyForSend(), authorizeSend?() == true, healthyForSend(), returnEvents.count == 2,
               let original = armedFocus else {
             cancelFromEvent("original application or send authorization unavailable")
             return false
         }
-        if callbackDeliveryRoute == nil,
-           clickOrder.requestCarrier(epoch: attemptEpoch, generation: currentPasteGeneration,
-               post: { self.postEvents($0, route: .session) }) { return false }
-        attemptActive = false
-        sentOnEventThread = true
-        lastSendReason = reason
-        postEvents(returnEvents, route: callbackDeliveryRoute ?? .process(original.processID))
+        let emitted = clickOrder.emitOrRequestCarrier(epoch: attemptEpoch, generation: currentPasteGeneration,
+            fromCallback: callbackDeliveryRoute != nil, post: { self.postEvents($0, route: .session) }) {
+                attemptActive = false
+                awaitingArmCapture = false
+                sentOnEventThread = true
+                lastSendReason = reason
+                postEvents(returnEvents, route: callbackDeliveryRoute ?? .process(original.processID))
+                publishClickOwner()
+            }
+        guard emitted else {
+            if let failure = clickOrder.failureReason(epoch: attemptEpoch, generation: currentPasteGeneration) { cancelFromEvent(failure) }
+            return false
+        }
         guard report else { return true }
         if dryRun { onSent?(reason) }
         else {
@@ -959,8 +1107,10 @@ final class InputMonitor {
     }
 
     private func monitoringInterrupted(_ reason: String) {
+        defer { publishClickOwner() }
         observedMonitoringGap = true
         pasteCapture = nil
+        awaitingArmCapture = false
         cancelFromEvent("input monitoring interrupted")
         onMonitoringChange?("input monitoring interrupted reason=\(reason)")
         onKeyboard?("input monitoring interrupted: \(reason)")
@@ -1005,6 +1155,7 @@ final class InputMonitor {
         attemptEpoch += 1
         publishedAttemptEpoch.store(attemptEpoch, ordering: .releasing)
         attemptActive = true
+        awaitingArmCapture = false
         armedFocus = focus
         clickOrder.adopt(epoch: attemptEpoch, generation: currentPasteGeneration) { self.postEvents($0, route: .session) }
         if dryRun, focus.sameTarget(as: simulatedFocus) { simulatedOriginalFocus = simulatedFocus }
@@ -1045,8 +1196,10 @@ final class InputMonitor {
         attemptEpoch += 1
         publishedAttemptEpoch.store(attemptEpoch, ordering: .releasing)
         attemptActive = false
+        awaitingArmCapture = false
         armedFocus = nil
         consumedPaste = nil
+        publishClickOwner()
         pasteBaseline = nil
         pendingDeparture = nil
         settlementDeadline = 0
@@ -1062,7 +1215,8 @@ final class InputMonitor {
     }
 
     func beginAttempt(recordID: String? = nil) -> Result<FocusSnapshot, InputMonitorError> {
-        stateLock.lock(); defer { stateLock.unlock() }
+        stateLock.lock(); defer { publishClickOwner(); stateLock.unlock() }
+        awaitingArmCapture = false
         recoverMonitoringIfNeeded()
         guard available else { return .failure(InputMonitorError(reason: "input monitoring unavailable: \(monitoringState.unavailableReason ?? "unknown")")) }
         let result: Result<FocusSnapshot, InputMonitorError>
@@ -1073,6 +1227,7 @@ final class InputMonitor {
         if let capture = pasteCapture, pasteRecordIDProvider == nil || (recordID != nil && capture.recordID == recordID) {
             pasteCapture = nil
             consumedPaste = capture
+            awaitingArmCapture = true
             result = .success(capture.focus)
         } else {
             consumedPaste = nil
@@ -1080,6 +1235,7 @@ final class InputMonitor {
             result = currentFocus()
         }
         if !dryRun, case .success(let snapshot) = result, !observeFocus(pid: snapshot.processID) {
+            awaitingArmCapture = false
             return .failure(InputMonitorError(reason: "focus notifications unavailable"))
         }
         return result
@@ -1360,6 +1516,14 @@ final class InputMonitor {
             return
         }
         let safe = epoch == attemptEpoch && sendNow(reason: "original-pid", report: false)
+        if !safe, epoch == attemptEpoch, attemptActive, clickOrder.isHolding {
+            // The first click can be held while authorizeSend was reading the DB.
+            // It is deferred work, not a failed delivery that should cancel it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.settlementRetryInterval) { [self] in
+                scheduleDelivery(epoch: epoch, completion: completion)
+            }
+            return
+        }
         DispatchQueue.main.async { completion(safe) }
     }
 

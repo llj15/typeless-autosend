@@ -49,8 +49,8 @@ let isoFrac: ISO8601DateFormatter = {
 }()
 let isoPlain = ISO8601DateFormatter()
 
-func log(_ msg: String) {
-    let ts = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime, .withFractionalSeconds])
+func log(_ msg: String, observedAt: Date = Date()) {
+    let ts = ISO8601DateFormatter.string(from: observedAt, timeZone: .current, formatOptions: [.withInternetDateTime, .withFractionalSeconds])
     print("[\(ts)] \(msg)")
     fflush(stdout)
 }
@@ -475,6 +475,12 @@ func cancelPending(_ reason: String) {
 inputMonitor.onKeyboard = cancelPending
 inputMonitor.onFocusChange = cancelPending
 inputMonitor.onMonitoringChange = { log($0) }
+inputMonitor.onDiagnostic = { message in
+    // Capture observation time before dispatch: diagnostics must neither block
+    // the event tap on stdout nor inherit a later attempt's pending row ID.
+    let observedAt = Date()
+    DispatchQueue.main.async { log("input \(message)", observedAt: observedAt) }
+}
 inputMonitor.onSent = { _ in finishPendingSend() }
 
 func cancelSupersededPending(_ rows: [Row]) {
@@ -590,6 +596,9 @@ func process(_ rows: [Row]) {
                   (latest.appCancellationRevisions[normalizeBundleID(front)] ?? 0) == appCancellationRevision else { return false }
             return noNewerLocalDictation(after: row.sequence)
         })
+        if let token = inputMonitor.currentObservationToken {
+            log("input phase=armed id=\(row.id) epoch=\(token.epoch) app=\(focus.bundleID) pid=\(focus.processID)")
+        }
         pendingGeneration += 1
         let generation = pendingGeneration
         writeRuntimeStatus()
