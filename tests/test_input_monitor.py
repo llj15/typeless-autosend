@@ -830,6 +830,48 @@ do {
     m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
     expect(delivered(m), "same nonempty text replacing a selection is a valid paste")
 }
+// Historical text plus an unrelated refresh never proves that Cmd+V worked.
+for selectionAvailable in [true, false] {
+    let clock = LogicalClock()
+    let m = make(requirePaste: true, manualSettle: true, now: { clock.now })
+    event(m, "state", ["text": "hello\nstatus old\n", "caret": 7, "selectionAvailable": selectionAvailable])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "hello\nstatus new\n", "caret": 7])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("history-only refresh") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true })
+    clock.now = 0.15
+    m.settleAttempt(testEvent: true)
+    let epoch = m.currentObservationToken!.epoch
+    var timerResult: Bool?
+    m.performDelivery(epoch: epoch) { timerResult = $0 }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.015))
+    expect(timerResult == nil && !m.sentAwaitingReport, "history-only refresh keeps delivery waiting for paste evidence")
+    clock.now = 1.01
+    m.settleAttempt(testEvent: true)
+    expect(!delivered(m), "failed paste plus a history refresh cannot submit an old draft")
+}
+// A real new occurrence can still establish a paste while other rows refresh.
+do {
+    let m = make(requirePaste: true)
+    event(m, "state", ["text": "hello\nstatus old\n> ", "selectionAvailable": false])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "hello\nstatus new\n> hello"])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("paste with history refresh") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(delivered(m), "a new paste occurrence survives unrelated refreshes and matching history")
+}
+// Multiple text-only insertion locations must not protect an arbitrary old row.
+do {
+    let m = make(requirePaste: true)
+    event(m, "state", ["text": "hello\nworldhello\n", "caret": 0])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "hello\nworldhello\nworldhello\n", "caret": 11])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("ambiguous paste") }
+    m.armAttempt(focus: f, pastedText: "hello\nworld", authorize: { true }); m.settleAttempt()
+    expect(valid(m), "ambiguous clean paste settles with a conservative baseline")
+    event(m, "unnotified_state", ["text": "HELLO\nworldhello\nworldhello\n"])
+    expect(!valid(m), "editing the actual first pasted line cancels despite a later matching candidate")
+}
 // Historical matching text is not evidence that a different selection was replaced.
 do {
     let m = make(requirePaste: true)

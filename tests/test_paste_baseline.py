@@ -90,7 +90,9 @@ print(String(data: try! JSONSerialization.data(withJSONObject: results), encodin
 
     def test_clean_paste_tolerates_dropped_final_separator_and_repeats(self):
         self.check_clean(before="abc", after="abchello", pasted="hello\n", expected=[3, 0])
-        self.check_clean(before="aa", after="aaa", pasted="a", expected=[2, 0])
+        self.check_clean(before="aa", after="aaa", pasted="a", expected=None)
+        self.check_clean(before="hello\nworldhello\n", after="hello\nworldhello\nworldhello\n",
+                         pasted="hello\nworld", expected=None)
 
     def test_clean_paste_rejects_any_other_change(self):
         self.check_clean(before="abc", after="abXchello", pasted="hello", expected=None)

@@ -32,9 +32,20 @@ struct PasteBaseline {
     /// The range of `before` that the paste replaced (empty for an insertion),
     /// found from the two texts alone. Applications may report caret offsets
     /// that disagree with their AX value, so a caret never locates the paste.
-    /// Nil unless `after` is exactly `before` with one range replaced by the
-    /// paste; the final line separator alone may be dropped by the input.
+    /// Nil unless exactly one range in `before` could have been replaced by
+    /// the paste; the final line separator alone may be dropped by the input.
     static func cleanPasteRange(before beforeText: String, after afterText: String, pasted pastedText: String) -> NSRange? {
+        if case .unique(let range) = cleanPasteLocation(before: beforeText, after: afterText, pasted: pastedText) { return range }
+        return nil
+    }
+
+    enum CleanPasteLocation {
+        case unique(NSRange), ambiguous, unavailable
+    }
+
+    /// Keep ambiguity distinct from an unrecognized refresh: alignment must
+    /// not choose a historical occurrence after text already proved multiple locations.
+    static func cleanPasteLocation(before beforeText: String, after afterText: String, pasted pastedText: String) -> CleanPasteLocation {
         let before = beforeText as NSString, after = afterText as NSString
         var prefix = 0
         while prefix < before.length, prefix < after.length,
@@ -45,20 +56,42 @@ struct PasteBaseline {
         var candidates = [pastedText]
         let evidence = settlementEvidenceText(pastedText)
         if evidence != pastedText, !evidence.isEmpty { candidates.append(evidence) }
+        var located: NSRange?
         for candidate in candidates {
             let paste = candidate as NSString
             let replaced = before.length + paste.length - after.length
             guard paste.length > 0, replaced >= 0 else { continue }
-            // The paste must start within the shared prefix and end within the shared suffix.
             let lowest = max(0, after.length - paste.length - suffix)
             let highest = min(prefix, after.length - paste.length, before.length - replaced)
             guard lowest <= highest else { continue }
             for location in stride(from: highest, through: lowest, by: -1)
                 where after.substring(with: NSRange(location: location, length: paste.length)) == candidate {
-                return NSRange(location: location, length: replaced)
+                let range = NSRange(location: location, length: replaced)
+                if let located, located != range { return .ambiguous }
+                located = range
             }
         }
-        return nil
+        return located.map { .unique($0) } ?? .unavailable
+    }
+
+    /// When refreshes prevent a clean replacement, an old matching occurrence
+    /// cannot prove insertion. Require the normalized evidence count to grow.
+    static func hasNewPastedTextEvidence(before: String, after: String, pasted: String) -> Bool {
+        let evidence = settlementEvidenceText(pasted.replacingOccurrences(of: "\r\n", with: "\n"))
+        guard !evidence.isEmpty else { return false }
+        func count(in value: String) -> Int {
+            let text = value.replacingOccurrences(of: "\r\n", with: "\n") as NSString
+            var offset = 0, occurrences = 0
+            while offset < text.length {
+                let found = text.range(of: evidence, options: .literal,
+                                       range: NSRange(location: offset, length: text.length - offset))
+                if found.location == NSNotFound { break }
+                occurrences += 1
+                offset = found.location + 1
+            }
+            return occurrences
+        }
+        return count(in: after) > count(in: before)
     }
 
     /// Detect edits before B becomes the baseline. Missing or ambiguous content

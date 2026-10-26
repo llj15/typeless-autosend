@@ -1424,8 +1424,13 @@ final class InputMonitor {
         // Unchanged text needs the stricter identical-selection evidence below;
         // without it, an old matching string cannot establish a successful paste.
         var pasteRange: NSRange?
+        var ambiguousPaste = false
         if let before, !pastedText.isEmpty {
-            pasteRange = PasteBaseline.cleanPasteRange(before: before.text, after: current.text, pasted: pastedText)
+            switch PasteBaseline.cleanPasteLocation(before: before.text, after: current.text, pasted: pastedText) {
+            case .unique(let range): pasteRange = range
+            case .ambiguous: ambiguousPaste = true
+            case .unavailable: break
+            }
             // Unchanged text is a paste only when it replaced an identical selection.
             if before.text == current.text {
                 let text = before.text as NSString
@@ -1440,18 +1445,26 @@ final class InputMonitor {
                     return
                 }
                 pasteRange = NSRange(location: before.selectionStart, length: before.selectionLength)
+                ambiguousPaste = false
             }
             guard PasteBaseline.hasPastedTextEvidence(in: current.text, pastedText: pastedText) else {
                 waitForPastedText(kind: "not_observed")
                 return
             }
-            if pasteRange == nil, PasteBaseline.settlementWasEdited(beforeText: before.text, insertionStart: nil,
+            if pasteRange == nil, !ambiguousPaste, PasteBaseline.settlementWasEdited(beforeText: before.text, insertionStart: nil,
                 afterText: current.text, pastedText: pastedText) {
                 cancelFromEvent("original content edited during paste buffer kind=content beforeUTF16=\(before.text.utf16.count) afterUTF16=\(current.text.utf16.count) pasteUTF16=\(pastedText.utf16.count)")
                 return
             }
+            if pasteRange == nil, !ambiguousPaste,
+               !PasteBaseline.hasNewPastedTextEvidence(before: before.text, after: current.text, pasted: pastedText) {
+                waitForPastedText(kind: "historical_only")
+                return
+            }
         }
-        pasteBaseline = PasteBaseline(beforeText: before?.text, insertionStart: pasteRange?.location,
+        // Do not let alignment choose one historical candidate after the exact
+        // replacement check already found multiple possible paste locations.
+        pasteBaseline = PasteBaseline(beforeText: ambiguousPaste ? nil : before?.text, insertionStart: pasteRange?.location,
             insertionLength: pasteRange?.length ?? 0, afterText: current.text, pastedText: pastedText)
         armedFocus = current
         settled = true
