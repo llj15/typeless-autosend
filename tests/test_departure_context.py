@@ -36,18 +36,28 @@ func arm(_ monitor: InputMonitor, caret: Int = 5) {
     guard case .success(let focus) = monitor.beginAttempt() else { fatalError("original focus") }
     monitor.armAttempt(focus: focus, authorize: { true }); monitor.settleAttempt()
 }
+// Focus already on another composer of the same application would receive a
+// late Return, so the attempt ends; the blur's caret reset is not reported as an edit.
+func expectDepartureCancel(_ monitor: InputMonitor, _ reason: String, _ label: String) {
+    expect(!monitor.sentAwaitingReport, "\(label): Return is not sent to the newly focused composer")
+    expect(reason.contains(InputMonitor.sameApplicationDepartureReason), "\(label): cancellation names the departure")
+    expect(!reason.contains("kind="), "\(label): blur reset is not reported as an edit")
+}
 if rule == "settled-blur" {
     let monitor = make(); arm(monitor)
+    var reason = ""
+    monitor.onKeyboard = { reason = $0 }
     event(monitor, "unnotified_state", ["caret": 0])
     event(monitor, "focus", ["input": "message-editor", "text": "other input", "caret": 0])
-    expect(monitor.sentAwaitingReport, "blur reset of original caret must not cancel departure to another composer")
-    expect(monitor.sentReason == "original-pid", "composer departure posts to captured PID")
+    expectDepartureCancel(monitor, reason, "observed composer departure")
 }
 if rule == "notified-blur" {
     let monitor = make(); arm(monitor)
+    var reason = ""
+    monitor.onKeyboard = { reason = $0 }
     event(monitor, "unnotified_state", ["caret": 0])
     event(monitor, "focus_notification", ["input": "message-editor"])
-    expect(monitor.sentAwaitingReport, "confirmed departure notification must not be overridden by stale focused identity")
+    expectDepartureCancel(monitor, reason, "notified composer departure")
 }
 if rule == "prearm-return-click" {
     let monitor = make()
@@ -87,15 +97,17 @@ if rule == "buffer-blur" || rule == "notified-buffer-blur" {
     event(monitor, "state", ["text": "> hello", "caret": 7])
     guard case .success(let focus) = monitor.beginAttempt() else { fatalError("buffer focus") }
     monitor.armAttempt(focus: focus, pastedText: "hello", authorize: { true })
+    var reason = ""
+    monitor.onKeyboard = { reason = $0 }
     event(monitor, "unnotified_state", ["caret": 0])
     if rule == "buffer-blur" {
         event(monitor, "focus", ["input": "message-editor", "text": "other input", "caret": 0])
     } else {
         event(monitor, "focus_notification", ["input": "message-editor"])
     }
-    expect(!monitor.sentAwaitingReport, "buffer composer departure waits for settlement")
+    expect(!monitor.sentAwaitingReport, "buffer composer departure never sends before settlement")
     monitor.settleAttempt()
-    expect(monitor.sentAwaitingReport, "blurred original caret does not cancel settled buffered departure")
+    expectDepartureCancel(monitor, reason, "buffered composer departure")
 }
 for field in rule == "real-edits" ? ["caret", "text", "selection"] : [] {
     let monitor = make(); arm(monitor, caret: field == "selection" ? 0 : 5)

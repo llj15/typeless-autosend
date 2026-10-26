@@ -15,6 +15,8 @@ HERE = Path(__file__).resolve().parent
 BINARY = Path(os.environ.get("TYPELESS_TEST_BINARY", HERE / ".work/typeless-autosend"))
 APP = "com.example.editor"
 OTHER = "com.example.chat"
+# Same-application departures end the attempt instead of posting a late Return.
+DEPARTURE = "focus left the original input within the application"
 
 
 class Runtime(unittest.TestCase):
@@ -246,7 +248,9 @@ class Runtime(unittest.TestCase):
         self.wait_for("would enter id=paste-race ", timeout=0.5)
         self.assertNotIn("skip id=paste-race ", self.text())
 
-    def test_buffer_outside_click_then_focus_change_sends_once_after_settlement(self):
+    def test_buffer_outside_click_then_focus_change_cancels_after_settlement(self):
+        # A natively held click cannot move focus; focus that moved anyway
+        # would receive the Return, so settlement ends the attempt.
         self.configure(delaySeconds=2)
         self.start(TYPELESS_TEST_MANUAL_SETTLE="1")
         self.complete("buffer-new-input")
@@ -255,9 +259,8 @@ class Runtime(unittest.TestCase):
         self.event("focus", input="another-input")
         self.assert_no_send("buffer-new-input", seconds=0.1)
         self.event("settle")
-        self.wait_for("would enter id=buffer-new-input destination=original-pid", timeout=0.5)
-        self.assertEqual(self.text().count("would enter id=buffer-new-input "), 1)
-        self.assertNotIn("skip id=buffer-new-input ", self.text())
+        self.wait_for(f"skip id=buffer-new-input {DEPARTURE}", timeout=0.5)
+        self.assertNotIn("would enter id=buffer-new-input ", self.text())
 
     def test_no_pending_attempt_never_sends_on_transition(self):
         self.start()
@@ -322,7 +325,7 @@ class Runtime(unittest.TestCase):
         self.wait_for("would enter id=redundant-focus ")
         self.assertNotIn("skip id=redundant-focus ", self.text())
 
-    def test_notification_for_another_target_sends_once_even_if_focus_has_returned(self):
+    def test_notification_for_another_target_cancels_even_if_focus_has_returned(self):
         self.configure(delaySeconds=2)
         self.start()
         for field, original in [("window", "window-1"), ("input", "input-1")]:
@@ -332,11 +335,10 @@ class Runtime(unittest.TestCase):
                 time.sleep(0.3)
                 self.event("focus_notification", **{field: "elsewhere"})
                 self.event("focus_notification", **{field: original})
-                self.wait_for(f"would enter id={identifier} destination=original-pid", timeout=0.5)
-                self.assertEqual(self.text().count(f"would enter id={identifier} "), 1)
-                self.assertNotIn(f"skip id={identifier} ", self.text())
+                self.wait_for(f"skip id={identifier} {DEPARTURE}", timeout=0.5)
+                self.assertNotIn(f"would enter id={identifier} ", self.text())
 
-    def test_same_application_departure_during_paste_buffer_sends_after_settlement(self):
+    def test_same_application_departure_during_paste_buffer_cancels_after_settlement(self):
         self.configure(delaySeconds=2)
         self.start(TYPELESS_TEST_MANUAL_SETTLE="1")
         for field in ["window", "input"]:
@@ -348,9 +350,8 @@ class Runtime(unittest.TestCase):
                 self.event("focus", **{field: "elsewhere"})
                 self.assert_no_send(identifier, seconds=0.15)
                 self.event("settle")
-                self.wait_for(f"would enter id={identifier} destination=original-pid", timeout=0.5)
-                self.assertEqual(self.text().count(f"would enter id={identifier} "), 1)
-                self.assertNotIn(f"skip id={identifier} ", self.text())
+                self.wait_for(f"skip id={identifier} {DEPARTURE}", timeout=0.5)
+                self.assertNotIn(f"would enter id={identifier} ", self.text())
 
     def test_unreadable_ax_content_is_not_editing_and_timeout_still_sends(self):
         self.configure(delaySeconds=0.5)
@@ -575,7 +576,7 @@ class Runtime(unittest.TestCase):
                 self.wait_for(f"would enter id={key} ")
                 self.assertNotIn(f"skip id={key} ", self.text())
 
-    def test_window_and_input_switches_send_once_before_the_countdown_expires(self):
+    def test_window_and_input_switches_cancel_before_the_countdown_expires(self):
         self.configure(delaySeconds=2)
         self.start()
         for field, original in [("window", "window-1"), ("input", "input-1")]:
@@ -584,9 +585,8 @@ class Runtime(unittest.TestCase):
                 time.sleep(0.3)
                 self.event("focus", **{field: "elsewhere"})
                 self.event("focus", **{field: original})
-                self.wait_for(f"would enter id={field} destination=original-pid", timeout=0.5)
-                self.assertEqual(self.text().count(f"would enter id={field} "), 1)
-                self.assertNotIn(f"skip id={field} ", self.text())
+                self.wait_for(f"skip id={field} {DEPARTURE}", timeout=0.5)
+                self.assertNotIn(f"would enter id={field} ", self.text())
 
     def test_composer_departure_ignores_blurred_original_selection_reset(self):
         self.configure(delaySeconds=2)
@@ -597,9 +597,10 @@ class Runtime(unittest.TestCase):
         time.sleep(0.3)
         self.event("unnotified_state", caret=0)
         self.event("focus", input="message-editor", text="other input", caret=0)
-        self.wait_for("would enter id=composer-blur destination=original-pid", timeout=0.5)
-        self.assertEqual(self.text().count("would enter id=composer-blur "), 1)
-        self.assertNotIn("skip id=composer-blur ", self.text())
+        self.wait_for(f"skip id=composer-blur {DEPARTURE}", timeout=0.5)
+        self.assertNotIn("would enter id=composer-blur ", self.text())
+        skip = next(line for line in self.text().splitlines() if "skip id=composer-blur " in line)
+        self.assertNotIn("kind=", skip)
 
     def test_deferred_cancellation_preserves_first_cause_in_daemon_log(self):
         self.configure(delaySeconds=2)

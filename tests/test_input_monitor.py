@@ -207,15 +207,14 @@ if ["window-after-settle", "window-during-buffer", "window-before-observation"].
         expect(!m.sentAwaitingReport, "buffer window departure waits for settlement")
         m.settleAttempt()
     }
-    expect(m.sentAwaitingReport, "same-PID window departure sends once after required settlement")
-    expect(m.sentReason == "original-pid", "window departure retains original-PID send intent")
+    // Return posted to the PID would reach the new window's focused input.
+    expect(!m.sentAwaitingReport && sends == 0, "same-PID window departure never posts Return to the new window")
     expect(m.preparedReturnTargetPIDs == [4242, 4242], "prepared Return down/up events retain the captured original PID")
-    expect(sends == 1, "window departure sends exactly once")
     guard case .success(let changed) = m.currentFocus() else { fatalError("changed window identity") }
     expect(changed.processID == original.processID, "window switch stays within original PID")
     event(m, "focus_notification", ["window": "window-3", "input": "input-3"])
     m.settleAttempt()
-    expect(!delivered(m) && sends == 1, "duplicate focus and timer cannot resend window departure")
+    expect(!delivered(m) && sends == 0, "later focus and timer cannot send after a same-application departure")
     print("monitor checks=\(checks)")
     exit(0)
 }
@@ -389,11 +388,10 @@ for notification in [kAXFocusedWindowChangedNotification, kAXFocusedUIElementCha
     m.performDelivery(epoch: token.epoch) { timerResult = $0 }
     let deadline = Date().addingTimeInterval(2)
     while timerResult == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
-    expect(timerResult != nil, "timer finishes after the queued focus notification")
-    expect(m.sentAwaitingReport && sends == 1, "queued focus departure sends once before a competing timer")
-    expect(m.sentReason == "original-pid", "queued focus departure keeps original PID send intent")
+    expect(timerResult == false, "timer finishes after the queued focus notification without sending")
+    expect(!m.sentAwaitingReport && sends == 0, "queued same-application focus departure cancels before a competing timer")
     m.handleAXNotification(notification, token: token, element: fakeTarget)
-    expect(!delivered(m) && sends == 1, "duplicate focus notification and timer cannot send twice")
+    expect(!delivered(m) && sends == 0, "duplicate focus notification and timer cannot send")
 }
 // A deferred value notification must compare the latest protected region
 // before a timer can send; reverting afterwards never resurrects the attempt.
@@ -544,6 +542,45 @@ let cycle = InputMonitor.classifyInputTarget(hit: 20, original: 1, equal: ==, pa
     return fakeStep(node)
 })
 expect(cycle == .unknown, "cyclic ancestry remains unknown")
+// Diagnostics name where each side of an inconclusive walk stopped and why.
+func trace(_ hit: Int, depth: Int = InputMonitor.ancestryDepthLimit, step: (Int) -> InputParentStep<Int> = fakeStep) -> InputAncestryTrace {
+    var trace = InputAncestryTrace()
+    _ = InputMonitor.classifyInputTarget(hit: hit, original: 1, equal: ==, parentStep: step, maximumDepth: depth, trace: &trace)
+    return trace
+}
+expect(trace(3) == InputAncestryTrace(hitSteps: 2, originalSteps: 3, hitEnd: .boundary, originalEnd: .open),
+       "outside trace records both climbs")
+let unreadable = trace(99)
+expect(unreadable.summary == "hit=1/unavailable original=3/boundary", "unreadable hit side is reported")
+expect(InputMonitor.ancestryCause(unreadable, failure: .deadline) == "deadline", "expired budget is named")
+expect(InputMonitor.ancestryCause(unreadable, failure: .error(.cannotComplete)) == "ax_timeout", "unanswered read is named")
+expect(InputMonitor.ancestryCause(unreadable, failure: .error(.invalidUIElement)) == "element_invalid", "destroyed element is named")
+expect(InputMonitor.ancestryCause(unreadable, failure: .unexpectedType) == "unreadable", "other read failures are grouped")
+expect(InputMonitor.ancestryCause(trace(4, depth: 1), failure: nil) == "depth", "depth limit is named")
+let cyclic = trace(20, step: { node in node == 20 ? .parent(21) : node == 21 ? .parent(20) : fakeStep(node) })
+expect(cyclic.hitEnd == .cycle && InputMonitor.ancestryCause(cyclic, failure: nil) == "cycle", "cycle is named")
+// A composer nested 33 levels below its window, clicked from a 12-level branch:
+// the walks only meet at the window, which the old 24-level limit never reached.
+func chainStep(_ node: Int) -> InputParentStep<Int> {
+    if node == 0 { return .boundary }
+    if node == 1033 || node == 2012 || node == 3150 { return .parent(0) }
+    return .parent(node + 1)
+}
+expect(InputMonitor.classifyInputTarget(hit: 2000, original: 1000, equal: ==, parentStep: chainStep) == .outside,
+       "deep composer reaches the shared window within the default limit")
+expect(InputMonitor.classifyInputTarget(hit: 2000, original: 1000, equal: ==, parentStep: chainStep, maximumDepth: 24) == .unknown,
+       "the former 24-level limit leaves the same click inconclusive")
+expect(InputMonitor.classifyInputTarget(hit: 2005, original: 2000, equal: ==, parentStep: chainStep) == .inside,
+       "an ancestor of a deep original is inside")
+let tooDeep = trace(2000, step: { node in node == 1 ? .parent(3000) : chainStep(node) })
+expect(InputMonitor.ancestryCause(tooDeep, failure: nil) == "depth" && tooDeep.originalSteps == InputMonitor.ancestryDepthLimit,
+       "a chain beyond the limit stays inconclusive")
+do {
+    let probe = AXReadProbe()
+    probe.read(); probe.fail(.error(.cannotComplete), "AXRole")
+    probe.read(); probe.fail(.deadline, "AXParent")
+    expect(probe.reads == 2 && probe.failureSummary == "ax-25204@AXRole", "probe keeps the first failed read")
+}
 do {
     let m = make(); arm(m)
     m.handleMouseTarget(relation(99), hitPID: 0)
@@ -581,7 +618,21 @@ do {
     event(m, "transition", ["sameInput": true])
     expect(valid(m), "original input and descendants preserve attempt")
     event(m, "focus_notification", ["window": "another-window"])
-    expect(m.sentAwaitingReport && m.sentReason == "original-pid", "same-app window departure sends immediately to original PID")
+    expect(!m.sentAwaitingReport && !delivered(m), "same-app window departure cancels instead of posting Return to the new window")
+}
+// Expiry confirms the frontmost application still focuses the original input,
+// covering a focus move whose notification has not been handled yet.
+for field in ["input", "window"] {
+    let m = make(); arm(m)
+    var reason = ""
+    m.onKeyboard = { reason = $0 }
+    event(m, "unnotified_state", [field: "\(field)-2"])
+    expect(!delivered(m), "expiry after an unobserved \(field) move does not send")
+    expect(reason.contains(InputMonitor.sameApplicationDepartureReason), "expiry names the \(field) departure")
+}
+do {
+    let m = make(); arm(m)
+    expect(delivered(m), "expiry with focus still on the original input sends")
 }
 do {
     let m = make(); arm(m)
@@ -663,7 +714,7 @@ do {
     event(m, "focus", ["window": "other-window", "input": "other-input", "text": "other content"])
     expect(!m.sentAwaitingReport, "buffer focus departure waits")
     m.settleAttempt()
-    expect(m.sentAwaitingReport && m.sentReason == "original-pid", "buffer focus departure sends after reading captured original input")
+    expect(!m.sentAwaitingReport && !delivered(m), "buffer focus departure cancels once settled")
 }
 do {
     let m = make(); guard case .success(let f) = m.beginAttempt() else { fatalError() }
@@ -717,6 +768,42 @@ do {
     event(m, "unnotified_state", ["text": "edited while current identity is unreadable"])
     expect(!valid(m), "captured input edits still cancel when current identity is unreadable")
 }
+// An input may report caret offsets that omit characters its value contains.
+// A clean append still settles and sends; later caret moves still cancel.
+do {
+    let m = make(requirePaste: true)
+    event(m, "state", ["text": "ab\ncd\n", "caret": 3])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "ab\ncd\nhello", "caret": 8])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("offset caret capture") }
+    var reason = ""
+    m.onKeyboard = { reason = $0 }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(valid(m) && reason.isEmpty, "offset caret does not turn a clean append into an edit")
+    event(m, "state", ["caret": 5])
+    expect(!valid(m), "caret movement after settlement still cancels")
+}
+do {
+    let m = make(requirePaste: true)
+    event(m, "state", ["text": "ab\ncd\n", "caret": 3])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "ab\ncd\nhello", "caret": 8])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("offset caret send") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(delivered(m), "offset caret clean append is delivered at expiry")
+}
+do {
+    let m = make(requirePaste: true)
+    event(m, "state", ["text": "ab\ncd\n", "caret": 3])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "ab\ncd\nhello", "caret": 8])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("offset caret edit") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(valid(m), "clean append settles before the edit")
+    // The protected region comes from the located paste, not the offset caret.
+    event(m, "unnotified_state", ["text": "ab\ncd\nhellX"])
+    expect(!valid(m), "editing the pasted line after settlement cancels")
+}
 // A verified paste event alone is not evidence that any text reached the
 // input. A completely empty snapshot B must never cause an empty Return.
 do {
@@ -742,6 +829,28 @@ do {
     guard case .success(let f) = m.beginAttempt() else { fatalError("identical selected-text replacement") }
     m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
     expect(delivered(m), "same nonempty text replacing a selection is a valid paste")
+}
+// Historical matching text is not evidence that a different selection was replaced.
+do {
+    let m = make(requirePaste: true)
+    event(m, "state", ["text": "hello world", "caret": 6, "selectionLength": 5])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "hello world", "caret": 11, "selectionLength": 0])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("failed selected paste") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(!delivered(m), "failed paste must not submit historical matching text")
+}
+// Identical replacements must protect the selected occurrence, not the last match.
+do {
+    let m = make(requirePaste: true)
+    event(m, "state", ["text": "hello\nhello", "caret": 0, "selectionLength": 5])
+    event(m, "typeless_paste")
+    event(m, "state", ["text": "hello\nhello", "caret": 5, "selectionLength": 0])
+    guard case .success(let f) = m.beginAttempt() else { fatalError("repeated selected paste") }
+    m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
+    expect(valid(m), "identical replacement settles")
+    event(m, "unnotified_state", ["text": "hellX\nhello"])
+    expect(!valid(m), "editing the selected first occurrence cancels")
 }
 // Focus departure still requires every send authorization and health gate.
 for failure in ["authorization", "new-record", "permission", "secure-input", "process-exit"] {
@@ -779,7 +888,9 @@ do {
     event(m, "state", ["text": "draft hello", "caret": 3])
     guard case .success(let f) = m.beginAttempt() else { fatalError("buffer caret capture") }
     m.armAttempt(focus: f, pastedText: "hello", authorize: { true }); m.settleAttempt()
-    expect(!delivered(m), "buffer caret movement is not accepted as post-paste caret")
+    // Caret offsets are never compared with text lengths, so the settled caret
+    // is the baseline; only movement after settlement is an edit signal.
+    expect(delivered(m), "the settled caret becomes the baseline for a clean paste")
 }
 print("monitor checks=\(checks)")
 ''')

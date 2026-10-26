@@ -29,6 +29,38 @@ struct PasteBaseline {
         return (normalizedText as NSString).range(of: evidence, options: .literal).location != NSNotFound
     }
 
+    /// The range of `before` that the paste replaced (empty for an insertion),
+    /// found from the two texts alone. Applications may report caret offsets
+    /// that disagree with their AX value, so a caret never locates the paste.
+    /// Nil unless `after` is exactly `before` with one range replaced by the
+    /// paste; the final line separator alone may be dropped by the input.
+    static func cleanPasteRange(before beforeText: String, after afterText: String, pasted pastedText: String) -> NSRange? {
+        let before = beforeText as NSString, after = afterText as NSString
+        var prefix = 0
+        while prefix < before.length, prefix < after.length,
+              before.character(at: prefix) == after.character(at: prefix) { prefix += 1 }
+        var suffix = 0
+        while suffix < before.length, suffix < after.length,
+              before.character(at: before.length - 1 - suffix) == after.character(at: after.length - 1 - suffix) { suffix += 1 }
+        var candidates = [pastedText]
+        let evidence = settlementEvidenceText(pastedText)
+        if evidence != pastedText, !evidence.isEmpty { candidates.append(evidence) }
+        for candidate in candidates {
+            let paste = candidate as NSString
+            let replaced = before.length + paste.length - after.length
+            guard paste.length > 0, replaced >= 0 else { continue }
+            // The paste must start within the shared prefix and end within the shared suffix.
+            let lowest = max(0, after.length - paste.length - suffix)
+            let highest = min(prefix, after.length - paste.length, before.length - replaced)
+            guard lowest <= highest else { continue }
+            for location in stride(from: highest, through: lowest, by: -1)
+                where after.substring(with: NSRange(location: location, length: paste.length)) == candidate {
+                return NSRange(location: location, length: replaced)
+            }
+        }
+        return nil
+    }
+
     /// Detect edits before B becomes the baseline. Missing or ambiguous content
     /// is not evidence of an edit; leave those cases to the whole-value fallback.
     static func settlementWasEdited(beforeText: String, insertionStart: Int?, insertionLength: Int = 0,

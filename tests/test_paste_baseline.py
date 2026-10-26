@@ -20,7 +20,12 @@ import Foundation
 
 let data = FileHandle.standardInput.readDataToEndOfFile()
 let cases = try! JSONSerialization.jsonObject(with: data) as! [[String: Any]]
-let results = cases.map { item -> Bool in
+let results = cases.map { item -> Any in
+    if item["operation"] as? String == "clean" {
+        guard let range = PasteBaseline.cleanPasteRange(before: item["before"] as! String,
+            after: item["after"] as! String, pasted: item["pasted"] as! String) else { return NSNull() }
+        return [range.location, range.length]
+    }
     if item["operation"] as? String == "evidence" {
         return PasteBaseline.hasPastedTextEvidence(in: item["text"] as! String, pastedText: item["pasted"] as! String)
     }
@@ -64,6 +69,34 @@ print(String(data: try! JSONSerialization.data(withJSONObject: results), encodin
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout), [expected], case)
+
+    def check_clean(self, *, before, after, pasted, expected):
+        case = dict(operation="clean", before=before, after=after, pasted=pasted)
+        result = subprocess.run([self.binary], input=json.dumps([case]),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout), [expected], case)
+
+    def test_clean_paste_is_located_from_text_without_a_caret(self):
+        self.check_clean(before="abc", after="abchello", pasted="hello", expected=[3, 0])
+        self.check_clean(before="ab\ncd", after="ab\nXYcd", pasted="XY", expected=[3, 0])
+        self.check_clean(before="", after="hello", pasted="hello", expected=[0, 0])
+        # UTF-16 offsets: the globe emoji occupies two units.
+        self.check_clean(before="你好🌍", after="你好🌍世界", pasted="世界", expected=[4, 0])
+
+    def test_clean_paste_covers_selection_replacement(self):
+        self.check_clean(before="one two three", after="one 2 three", pasted="2", expected=[4, 3])
+        self.check_clean(before="say hello", after="say hello", pasted="hello", expected=[4, 5])
+
+    def test_clean_paste_tolerates_dropped_final_separator_and_repeats(self):
+        self.check_clean(before="abc", after="abchello", pasted="hello\n", expected=[3, 0])
+        self.check_clean(before="aa", after="aaa", pasted="a", expected=[2, 0])
+
+    def test_clean_paste_rejects_any_other_change(self):
+        self.check_clean(before="abc", after="abXchello", pasted="hello", expected=None)
+        self.check_clean(before="abc", after="abcHello", pasted="hello", expected=None)
+        self.check_clean(before="abc", after="abc", pasted="hello", expected=None)
+        self.check_clean(before="abc", after="ab", pasted="hello", expected=None)
 
     def check_evidence(self, *, text, pasted, expected):
         case = dict(operation="evidence", text=text, pasted=pasted)

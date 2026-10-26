@@ -235,6 +235,31 @@ enum InputParentStep<Element> {
     case boundary
     case unavailable
 }
+// Where one side of an ancestry walk stopped; `open` means it was still
+// climbing when the walk returned or ran out of depth.
+enum InputAncestryEnd: String { case open, boundary, unavailable, cycle }
+struct InputAncestryTrace: Equatable {
+    var hitSteps = 0, originalSteps = 0
+    var hitEnd = InputAncestryEnd.open, originalEnd = InputAncestryEnd.open
+    var summary: String { "hit=\(hitSteps)/\(hitEnd.rawValue) original=\(originalSteps)/\(originalEnd.rawValue)" }
+}
+enum AXReadFailure: Equatable { case deadline, error(AXError), unexpectedType }
+// Diagnostics for one classification: counts AX reads and keeps the first
+// failed read, which is what turned a walk inconclusive.
+final class AXReadProbe {
+    private(set) var reads = 0
+    private(set) var failure: (kind: AXReadFailure, attribute: String)?
+    func read() { reads += 1 }
+    func fail(_ kind: AXReadFailure, _ attribute: String) { if failure == nil { failure = (kind, attribute) } }
+    var failureSummary: String {
+        guard let failure else { return "none" }
+        switch failure.kind {
+        case .deadline: return "deadline@\(failure.attribute)"
+        case .error(let error): return "ax\(error.rawValue)@\(failure.attribute)"
+        case .unexpectedType: return "type@\(failure.attribute)"
+        }
+    }
+}
 
 private struct InputMonitoringState: Equatable {
     var permissionGranted = true
@@ -694,17 +719,27 @@ final class InputMonitor {
     }
     private func classifyClick(_ event: CGEvent, original: FocusSnapshot, mouseTarget: InputTargetRelation?) -> (relation: InputTargetRelation, reason: String) {
         if let mouseTarget { return (mouseTarget, String(describing: mouseTarget)) }
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.025
+        // Timings cover the whole classification the held click waits for.
+        let started = ProcessInfo.processInfo.systemUptime
+        let deadline = started + 0.025
+        func milliseconds(since start: TimeInterval) -> String {
+            String(format: "%.1f", (ProcessInfo.processInfo.systemUptime - start) * 1000)
+        }
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, 0.005)
         var hit: AXUIElement?
-        guard AXUIElementCopyElementAtPosition(system, Float(event.location.x), Float(event.location.y), &hit) == .success,
-              let hit else { return (.unknown, "hit_unavailable") }
+        let hitError = AXUIElementCopyElementAtPosition(system, Float(event.location.x), Float(event.location.y), &hit)
+        let hitTiming = "hit_ms=\(milliseconds(since: started))"
+        guard hitError == .success, let hit else {
+            return (.unknown, "hit_unavailable ax=\(hitError.rawValue) \(hitTiming) ms=\(milliseconds(since: started))")
+        }
         var pid: pid_t = 0
         guard AXUIElementGetPid(hit, &pid) == .success else { return (.unknown, "hit_pid_unavailable") }
         guard pid == original.processID else { return (.unknown, "other_app") }
-        let relation = original.input.map { classifyInputTarget(hit, $0, deadline: deadline) } ?? .unknown
-        return (relation, relation == .unknown ? "unknown_ancestry" : String(describing: relation))
+        guard let input = original.input else { return (.unknown, "unknown_ancestry cause=no_original_input") }
+        let (relation, detail) = classifyInputTarget(hit, input, deadline: deadline)
+        let result = relation == .unknown ? "unknown_ancestry" : String(describing: relation)
+        return (relation, "\(result) \(detail) \(hitTiming) ms=\(milliseconds(since: started))")
     }
     private func retryClickClassification(serial: Int64, event: CGEvent, mouseTarget: InputTargetRelation?) {
         DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(5)) { [weak self] in
@@ -850,7 +885,7 @@ final class InputMonitor {
               let hit else { return } // Deactivation handles clicks into another application.
         var pid: pid_t = 0
         guard AXUIElementGetPid(hit, &pid) == .success, pid == original.processID else { return }
-        let relation = original.input.map { classifyInputTarget(hit, $0, deadline: deadline) } ?? .unknown
+        let relation = original.input.map { classifyInputTarget(hit, $0, deadline: deadline).relation } ?? .unknown
         handleMouseTarget(relation, hitPID: pid)
     }
 
@@ -870,39 +905,58 @@ final class InputMonitor {
         }
     }
 
+    // Web-based composers were measured up to 33 levels below their window, and
+    // browser pages nest below their own chrome. The AX deadline, not this
+    // limit, bounds how long a walk can hold a click.
+    static let ancestryDepthLimit = 100
+
     // A common ancestor above two separate branches proves separation without
     // reading ancestors beyond it. Advance both walks so a deep web hierarchy
     // cannot consume the entire AX budget before inspecting the original side.
     static func classifyInputTarget<Element>(hit: Element, original: Element,
             equal: (Element, Element) -> Bool, parentStep: (Element) -> InputParentStep<Element>,
-            maximumDepth: Int = 24) -> InputTargetRelation {
+            maximumDepth: Int = ancestryDepthLimit) -> InputTargetRelation {
+        var trace = InputAncestryTrace()
+        return classifyInputTarget(hit: hit, original: original, equal: equal, parentStep: parentStep,
+                                   maximumDepth: maximumDepth, trace: &trace)
+    }
+
+    static func classifyInputTarget<Element>(hit: Element, original: Element,
+            equal: (Element, Element) -> Bool, parentStep: (Element) -> InputParentStep<Element>,
+            maximumDepth: Int = ancestryDepthLimit, trace: inout InputAncestryTrace) -> InputTargetRelation {
         if equal(hit, original) { return .inside }
         var hitPath: [Element] = [], originalPath: [Element] = []
+        defer { trace.hitSteps = hitPath.count; trace.originalSteps = originalPath.count }
         var hitNode: Element? = hit, originalNode: Element? = original
         var hitComplete = false, originalComplete = false
         for _ in 0..<maximumDepth {
+            var newHit: Element?, newOriginal: Element?
             if let node = hitNode {
-                if hitPath.contains(where: { equal($0, node) }) { hitNode = nil }
-                else { hitPath.append(node) }
+                if hitPath.contains(where: { equal($0, node) }) { hitNode = nil; trace.hitEnd = .cycle }
+                else { hitPath.append(node); newHit = node }
             }
             if let node = originalNode {
-                if originalPath.contains(where: { equal($0, node) }) { originalNode = nil }
-                else { originalPath.append(node) }
+                if originalPath.contains(where: { equal($0, node) }) { originalNode = nil; trace.originalEnd = .cycle }
+                else { originalPath.append(node); newOriginal = node }
             }
-            if hitPath.contains(where: { equal($0, original) }) || originalPath.contains(where: { equal($0, hit) }) { return .inside }
-            if hitPath.contains(where: { left in originalPath.contains(where: { equal(left, $0) }) }) { return .outside }
+            // Earlier steps compared every older pair, so only this step's
+            // nodes can join the paths; containment still wins over separation.
+            if let node = newHit, equal(node, original) { return .inside }
+            if let node = newOriginal, equal(node, hit) { return .inside }
+            if let node = newHit, originalPath.contains(where: { equal(node, $0) }) { return .outside }
+            if let node = newOriginal, hitPath.contains(where: { equal($0, node) }) { return .outside }
             if let node = hitNode {
                 switch parentStep(node) {
                 case .parent(let parent): hitNode = parent
-                case .boundary: hitNode = nil; hitComplete = true
-                case .unavailable: hitNode = nil
+                case .boundary: hitNode = nil; hitComplete = true; trace.hitEnd = .boundary
+                case .unavailable: hitNode = nil; trace.hitEnd = .unavailable
                 }
             }
             if let node = originalNode {
                 switch parentStep(node) {
                 case .parent(let parent): originalNode = parent
-                case .boundary: originalNode = nil; originalComplete = true
-                case .unavailable: originalNode = nil
+                case .boundary: originalNode = nil; originalComplete = true; trace.originalEnd = .boundary
+                case .unavailable: originalNode = nil; trace.originalEnd = .unavailable
                 }
             }
             if hitNode == nil && originalNode == nil { break }
@@ -910,21 +964,50 @@ final class InputMonitor {
         return hitComplete && originalComplete ? .outside : .unknown
     }
 
-    private func classifyInputTarget(_ hit: AXUIElement, _ original: AXUIElement,
-                                     deadline: TimeInterval) -> InputTargetRelation {
-        // An application-level hit can contain the original window even when
-        // the hit test omits every descendant. It never proves an outside click.
-        if attribute(hit, kAXRoleAttribute, deadline: deadline) as? String == kAXApplicationRole { return .unknown }
-        return Self.classifyInputTarget(hit: hit, original: original, equal: { CFEqual($0, $1) }, parentStep: { element in
-            self.inputParentStep(element, deadline: deadline)
-        })
+    // Names the reason an ancestry walk stayed inconclusive. A cycle wins;
+    // otherwise the first failed read decides, and a walk without one ran out of depth.
+    static func ancestryCause(_ trace: InputAncestryTrace, failure: AXReadFailure?) -> String {
+        if trace.hitEnd == .cycle || trace.originalEnd == .cycle { return "cycle" }
+        switch failure {
+        case .deadline?: return "deadline"
+        case .error(.cannotComplete)?: return "ax_timeout"
+        case .error(.invalidUIElement)?: return "element_invalid"
+        case .some: return "unreadable"
+        case nil: return trace.hitEnd == .open || trace.originalEnd == .open ? "depth" : "incomplete"
+        }
     }
 
-    private func inputParentStep(_ element: AXUIElement, deadline: TimeInterval) -> InputParentStep<AXUIElement> {
-        guard let role = attribute(element, kAXRoleAttribute, deadline: deadline) as? String else { return .unavailable }
+    private func classifyInputTarget(_ hit: AXUIElement, _ original: AXUIElement,
+                                     deadline: TimeInterval) -> (relation: InputTargetRelation, detail: String) {
+        let probe = AXReadProbe()
+        let role = attribute(hit, kAXRoleAttribute, deadline: deadline, probe: probe) as? String
+        func detail(_ relation: InputTargetRelation, _ trace: InputAncestryTrace?) -> String {
+            var fields = ["role=\(role ?? "unreadable")"]
+            if relation == .unknown {
+                let cause = trace.map { Self.ancestryCause($0, failure: probe.failure?.kind) } ?? "application_hit"
+                fields.append("cause=\(cause)")
+            }
+            if let trace { fields.append(trace.summary) }
+            fields += ["reads=\(probe.reads)", "fail=\(probe.failureSummary)"]
+            return fields.joined(separator: " ")
+        }
+        // An application-level hit can contain the original window even when
+        // the hit test omits every descendant. It never proves an outside click.
+        if role == kAXApplicationRole { return (.unknown, detail(.unknown, nil)) }
+        var trace = InputAncestryTrace()
+        let relation = Self.classifyInputTarget(hit: hit, original: original, equal: { CFEqual($0, $1) }, parentStep: { element in
+            self.inputParentStep(element, deadline: deadline, probe: probe)
+        }, trace: &trace)
+        return (relation, detail(relation, trace))
+    }
+
+    private func inputParentStep(_ element: AXUIElement, deadline: TimeInterval,
+                                 probe: AXReadProbe? = nil) -> InputParentStep<AXUIElement> {
+        guard let roleValue = attribute(element, kAXRoleAttribute, deadline: deadline, probe: probe) else { return .unavailable }
+        guard let role = roleValue as? String else { probe?.fail(.unexpectedType, kAXRoleAttribute); return .unavailable }
         if [kAXWindowRole, kAXApplicationRole].contains(role) { return .boundary }
-        guard let parent = attribute(element, kAXParentAttribute, deadline: deadline),
-              CFGetTypeID(parent) == AXUIElementGetTypeID() else { return .unavailable }
+        guard let parent = attribute(element, kAXParentAttribute, deadline: deadline, probe: probe) else { return .unavailable }
+        guard CFGetTypeID(parent) == AXUIElementGetTypeID() else { probe?.fail(.unexpectedType, kAXParentAttribute); return .unavailable }
         return .parent(parent as! AXUIElement)
     }
 
@@ -1241,11 +1324,14 @@ final class InputMonitor {
         return result
     }
 
-    private func attribute(_ element: AXUIElement, _ name: String, deadline: TimeInterval) -> CFTypeRef? {
-        guard ProcessInfo.processInfo.systemUptime < deadline else { return nil }
+    private func attribute(_ element: AXUIElement, _ name: String, deadline: TimeInterval,
+                           probe: AXReadProbe? = nil) -> CFTypeRef? {
+        guard ProcessInfo.processInfo.systemUptime < deadline else { probe?.fail(.deadline, name); return nil }
         AXUIElementSetMessagingTimeout(element, 0.005)
         var result: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, name as CFString, &result) == .success else { return nil }
+        probe?.read()
+        let error = AXUIElementCopyAttributeValue(element, name as CFString, &result)
+        guard error == .success else { probe?.fail(.error(error), name); return nil }
         return result
     }
 
@@ -1334,46 +1420,39 @@ final class InputMonitor {
             return
         }
         let before = consumedPaste?.focus
-        let reportsSelection = before?.selectionAvailable == true && current.selectionAvailable &&
-            (before?.selectionStart != 0 || before?.selectionLength != 0 || current.selectionStart != 0 || current.selectionLength != 0)
-        let compareSelection = pendingDeparture?.focusChanged != true &&
-            originalInputIsFocused(original, deadline: ProcessInfo.processInfo.systemUptime + 0.025)
+        // Changed text locates the paste without trusting reported caret offsets.
+        // Unchanged text needs the stricter identical-selection evidence below;
+        // without it, an old matching string cannot establish a successful paste.
+        var pasteRange: NSRange?
         if let before, !pastedText.isEmpty {
+            pasteRange = PasteBaseline.cleanPasteRange(before: before.text, after: current.text, pasted: pastedText)
+            // Unchanged text is a paste only when it replaced an identical selection.
             if before.text == current.text {
                 let text = before.text as NSString
                 let (expectedCaret, overflow) = before.selectionStart.addingReportingOverflow(pastedText.utf16.count)
-                let trustedSameTextReplacement = before.selectionAvailable && current.selectionAvailable &&
+                let replacedSelection = before.selectionAvailable && current.selectionAvailable &&
                     before.selectionStart >= 0 && before.selectionLength > 0 &&
                     before.selectionStart <= text.length && before.selectionLength <= text.length - before.selectionStart &&
                     text.substring(with: NSRange(location: before.selectionStart, length: before.selectionLength)) == pastedText &&
                     !overflow && current.selectionStart == expectedCaret && current.selectionLength == 0
-                guard trustedSameTextReplacement else {
+                guard replacedSelection else {
                     waitForPastedText(kind: "unchanged")
                     return
                 }
+                pasteRange = NSRange(location: before.selectionStart, length: before.selectionLength)
             }
             guard PasteBaseline.hasPastedTextEvidence(in: current.text, pastedText: pastedText) else {
                 waitForPastedText(kind: "not_observed")
                 return
             }
-            if PasteBaseline.settlementWasEdited(beforeText: before.text,
-                insertionStart: reportsSelection ? before.selectionStart : nil,
-                insertionLength: reportsSelection ? before.selectionLength : 0,
+            if pasteRange == nil, PasteBaseline.settlementWasEdited(beforeText: before.text, insertionStart: nil,
                 afterText: current.text, pastedText: pastedText) {
                 cancelFromEvent("original content edited during paste buffer kind=content beforeUTF16=\(before.text.utf16.count) afterUTF16=\(current.text.utf16.count) pasteUTF16=\(pastedText.utf16.count)")
                 return
             }
-            if reportsSelection && compareSelection {
-                let (expectedCaret, overflow) = before.selectionStart.addingReportingOverflow(pastedText.utf16.count)
-                if overflow || current.selectionStart != expectedCaret || current.selectionLength != 0 {
-                    cancelFromEvent("original caret/selection changed during paste buffer kind=\(current.selectionLength != 0 ? "selection" : "caret") expected=\(expectedCaret) actual=\(current.selectionStart) length=\(current.selectionLength)")
-                    return
-                }
-            }
         }
-        pasteBaseline = PasteBaseline(beforeText: before?.text,
-            insertionStart: reportsSelection ? before?.selectionStart : nil,
-            insertionLength: reportsSelection ? before?.selectionLength ?? 0 : 0, afterText: current.text, pastedText: pastedText)
+        pasteBaseline = PasteBaseline(beforeText: before?.text, insertionStart: pasteRange?.location,
+            insertionLength: pasteRange?.length ?? 0, afterText: current.text, pastedText: pastedText)
         armedFocus = current
         settled = true
         settlementRetryScheduled = false
@@ -1421,8 +1500,8 @@ final class InputMonitor {
         if case .success(let identity) = inspectIdentity(original, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025) {
             let relation = focusedInputRelation(original: original, focused: identity, deadline: deadline ?? ProcessInfo.processInfo.systemUptime + 0.025)
             if Self.focusHasDeparted(original: original, focused: identity, inputRelation: relation) {
-                requestDeparture("original-pid", focusChanged: true)
-                return .success(original)
+                let reason = cancelSameApplicationDeparture()
+                return .failure(InputMonitorError(reason: reason))
             }
             compareSelection = relation == .inside
         }
@@ -1515,6 +1594,15 @@ final class InputMonitor {
             }
             return
         }
+        // A focus move can precede its notification. Confirm at expiry that a
+        // frontmost application still focuses the original input.
+        if epoch == attemptEpoch, attemptActive, let original = armedFocus, originalIsFrontmost(original),
+           case .success(let focused) = inspectIdentity(original, deadline: ProcessInfo.processInfo.systemUptime + 0.025),
+           focusHasDeparted(original: original, focused: focused, deadline: ProcessInfo.processInfo.systemUptime + 0.025) {
+            cancelSameApplicationDeparture()
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
         let safe = epoch == attemptEpoch && sendNow(reason: "original-pid", report: false)
         if !safe, epoch == attemptEpoch, attemptActive, clickOrder.isHolding {
             // The first click can be held while authorizeSend was reading the DB.
@@ -1604,10 +1692,30 @@ final class InputMonitor {
         handleFocusNotification(notified)
     }
 
+    // Return posted to the process reaches whatever it focuses now. Once focus
+    // has left the original input inside a frontmost application, a late send
+    // would submit the new target, so the attempt ends instead. Sends before a
+    // held click, and after the application leaves the foreground, still apply.
+    static let sameApplicationDepartureReason = "focus left the original input within the application"
+
+    // An edit made before leaving remains the more specific reason. Without a
+    // settled baseline there is no protected region to compare yet.
+    @discardableResult
+    private func cancelSameApplicationDeparture() -> String {
+        var reason = Self.sameApplicationDepartureReason
+        if settled, let original = armedFocus,
+           case .success(let current) = inspectInput(dryRun ? (simulatedOriginalFocus ?? original) : original,
+                                                     deadline: ProcessInfo.processInfo.systemUptime + 0.025),
+           let edit = contentEditReason(current, baseline: original, compareSelection: false) { reason = edit }
+        let contextualReason = cancellationContext(reason)
+        cancelFromEvent(contextualReason)
+        return contextualReason
+    }
+
     private func handleFocusNotification(_ notified: FocusSnapshot) {
         guard attemptActive, let original = armedFocus, originalIsFrontmost(original) else { return }
         if focusHasDeparted(original: original, focused: notified, deadline: ProcessInfo.processInfo.systemUptime + 0.025) {
-            requestDeparture("original-pid", focusChanged: true)
+            cancelSameApplicationDeparture()
             return
         }
         _ = validateAttempt()
