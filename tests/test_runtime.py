@@ -15,6 +15,8 @@ HERE = Path(__file__).resolve().parent
 BINARY = Path(os.environ.get("TYPELESS_TEST_BINARY", HERE / ".work/typeless-autosend"))
 APP = "com.example.editor"
 OTHER = "com.example.chat"
+# Same-application departures end the attempt instead of posting a late Return.
+DEPARTURE = "focus left the original input within the application"
 
 
 class Runtime(unittest.TestCase):
@@ -73,15 +75,28 @@ class Runtime(unittest.TestCase):
             time.sleep(0.04)
         self.fail(f"status did not satisfy expectation: {status}")
 
+    def wait_pending_file(self, timeout=3):
+        # A CLI subprocess can take longer than the 150 ms buffer on macOS.
+        # Observe the daemon's atomic status write directly for buffer-edge tests.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if json.loads((self.directory / "runtime-status.json").read_text()).get("pending"):
+                    return
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            time.sleep(0.002)
+        self.fail("daemon did not arm a pending attempt")
+
     def complete(self, identifier):
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         self.db.execute("insert into history_v2(id,status,mode,refined_text,created_at,updated_at,app_version,synced_from_cloud) values(?, 'completed','voice_transcript','hello',?,?, 'x',0)",
                         (identifier, timestamp, timestamp))
         self.db.commit()
 
-    def event(self, kind, **fields):
+    def event(self, event_type, **fields):
         with self.events.open("a") as handle:
-            handle.write(json.dumps({"type": kind, **fields}) + "\n")
+            handle.write(json.dumps({"type": event_type, **fields}) + "\n")
 
     def commands_while_daemon_suspended(self, *commands):
         # Model a busy daemon so a short CLI state transition cannot rely on lucky poll timing.
@@ -111,6 +126,149 @@ class Runtime(unittest.TestCase):
         time.sleep(seconds)
         self.assertNotIn(f"would enter id={identifier} ", self.text())
 
+    def test_background_fn_does_not_cancel_sent_dictation(self):
+        self.configure(delaySeconds=2)
+        self.start()
+        self.complete("background-fn")
+        time.sleep(0.3)
+        self.event("focus", app=OTHER)
+        self.event("keyboard", origin="physical", key="fn")
+        self.wait_for("would enter id=background-fn destination=original-pid", timeout=0.5)
+        self.assertNotIn("skip id=background-fn ", self.text())
+
+    def test_application_switch_during_paste_buffer_keeps_original_attempt(self):
+        self.configure(delaySeconds=0.5)
+        self.start(TYPELESS_TEST_MANUAL_SETTLE="1")
+        self.complete("early-app-switch")
+        self.wait_pending_file()
+        self.event("focus", app=OTHER)
+        self.event("settle")
+        self.wait_for("would enter id=early-app-switch destination=original-pid")
+        self.assertNotIn("skip id=early-app-switch ", self.text())
+
+    def test_outside_clicks_send_for_all_controls_buttons_and_modifiers(self):
+        self.configure(delaySeconds=2)
+        self.start()
+        cases = [
+            {"targetRole": "AXComboBox", "verified": True},
+            {"targetRole": "AXButton", "verified": True},
+            {"targetRole": "AXWindow", "verified": True},
+            {"verified": True, "left": False},
+            {"verified": False},
+            {"modifiers": ["shift", "command"]},
+        ]
+        for index, fields in enumerate(cases):
+            identifier = f"outside-control-{index}"
+            self.complete(identifier)
+            time.sleep(0.3)
+            self.event("transition", **fields)
+            self.wait_for(f"would enter id={identifier} destination=before-focus-change", timeout=0.5)
+
+    def test_tab_is_ignored_and_application_departure_sends(self):
+        self.configure(delaySeconds=0.6)
+        self.start()
+        self.complete("plain-tab")
+        time.sleep(0.3)
+        self.event("transition", kind="tab")
+        self.wait_for("would enter id=plain-tab destination=original-pid")
+        self.complete("command-tab-policy")
+        time.sleep(0.3)
+        self.event("transition", kind="tab", modifiers=["command"])
+        self.event("focus", app=OTHER)
+        self.wait_for("would enter id=command-tab-policy destination=original-pid", timeout=0.5)
+
+    def test_verified_focus_transition_sends_once_before_focus_change(self):
+        self.configure(delaySeconds=3)
+        self.start()
+        self.complete("transition")
+        self.wait_pending_file()
+        time.sleep(0.3)
+        self.event("transition", verified=True)
+        self.event("focus", input="input-2", window="window-2")
+        self.wait_for("would enter id=transition destination=before-focus-change", timeout=0.5)
+        self.event("transition", verified=True)
+        time.sleep(3.2)
+        self.assertEqual(self.text().count("would enter id=transition "), 1)
+
+    def test_external_activity_sends_to_original_pid_and_ignores_background_edits(self):
+        self.configure(delaySeconds=0.7)
+        self.start()
+        self.complete("background")
+        time.sleep(0.3)
+        self.event("keyboard", origin="physical", key="command-tab")
+        self.event("focus", app=OTHER)
+        self.event("keyboard", origin="physical", key="return")
+        self.event("state", text="unrelated", caret=4)
+        self.wait_for("would enter id=background ", timeout=0.85)
+        self.assertIn("destination=original-pid", self.text())
+        self.assertNotIn("skip id=background ", self.text())
+
+    def test_outside_transition_sends_and_redundant_edit_notification_preserves(self):
+        self.configure(delaySeconds=0.6)
+        self.start()
+        self.complete("transition")
+        time.sleep(0.3)
+        self.event("transition", verified=False)
+        self.wait_for("would enter id=transition destination=before-focus-change")
+        self.complete("edit-notification")
+        time.sleep(0.3)
+        self.event("edit_notification")
+        self.wait_for("would enter id=edit-notification destination=original-pid")
+        self.assertNotIn("skip id=edit-notification ", self.text())
+
+    def test_background_original_focus_notification_does_not_cancel_departure_send(self):
+        self.configure(delaySeconds=2)
+        self.start()
+        self.complete("background-focus")
+        time.sleep(0.3)
+        self.event("focus", app=OTHER)
+        self.event("focus_notification", input="different-original-input")
+        self.wait_for("would enter id=background-focus destination=original-pid", timeout=0.5)
+        self.assertNotIn("skip id=background-focus ", self.text())
+
+    def test_content_or_selection_change_without_keyboard_cancels(self):
+        self.configure(delaySeconds=0.6)
+        self.start()
+        for index, fields in enumerate(({"text": "changed"}, {"caret": 3}, {"selectionLength": 2})):
+            identifier = f"edit-{index}"
+            self.complete(identifier)
+            time.sleep(0.3)
+            self.event("state", **fields)
+            self.wait_for(f"skip id={identifier} ")
+            self.assert_no_send(identifier, seconds=0.7)
+
+    def test_transition_before_paste_settlement_waits_then_sends(self):
+        self.configure(delaySeconds=2)
+        self.start(TYPELESS_TEST_MANUAL_SETTLE="1")
+        self.complete("paste-race")
+        self.wait_pending_file()
+        self.event("transition", verified=True)
+        self.assert_no_send("paste-race", seconds=0.2)
+        self.event("settle")
+        self.wait_for("would enter id=paste-race ", timeout=0.5)
+        self.assertNotIn("skip id=paste-race ", self.text())
+
+    def test_buffer_outside_click_then_focus_change_cancels_after_settlement(self):
+        # A natively held click cannot move focus; focus that moved anyway
+        # would receive the Return, so settlement ends the attempt.
+        self.configure(delaySeconds=2)
+        self.start(TYPELESS_TEST_MANUAL_SETTLE="1")
+        self.complete("buffer-new-input")
+        self.wait_pending_file()
+        self.event("transition", verified=True)
+        self.event("focus", input="another-input")
+        self.assert_no_send("buffer-new-input", seconds=0.1)
+        self.event("settle")
+        self.wait_for(f"skip id=buffer-new-input {DEPARTURE}", timeout=0.5)
+        self.assertNotIn("would enter id=buffer-new-input ", self.text())
+
+    def test_no_pending_attempt_never_sends_on_transition(self):
+        self.start()
+        self.event("transition", verified=True)
+        self.event("keyboard", origin="physical", key="tab")
+        time.sleep(0.3)
+        self.assertNotIn("would enter", self.text())
+
     def test_default_waits_one_second_after_paste_buffer(self):
         self.start()
         self.complete("default-delay")
@@ -124,25 +282,25 @@ class Runtime(unittest.TestCase):
         self.assert_no_send("override", seconds=0.25)
         self.wait_for("would enter id=override ", timeout=0.6)
 
-    def test_fn_cancels_old_attempt_and_new_completion_gets_fresh_countdown(self):
+    def test_fn_preserves_old_attempt_and_new_completion_gets_fresh_countdown(self):
+        self.configure(delaySeconds=0.5)
         self.start()
         self.complete("old")
         time.sleep(0.25)
         self.event("keyboard", origin="physical", key="fn")
-        self.wait_for("skip id=old ")
+        self.wait_for("would enter id=old ")
         self.complete("new")
-        self.assert_no_send("new", seconds=0.75)
+        self.assert_no_send("new", seconds=0.35)
         self.wait_for("would enter id=new ")
-        self.assert_no_send("old")
 
-    def test_switching_between_enabled_apps_cancels_even_when_switching_back(self):
+    def test_switching_between_enabled_apps_sends_once_to_original_pid(self):
         self.start()
         self.complete("app-switch")
         time.sleep(0.25)
         self.event("focus", app=OTHER)
         self.event("focus", app=APP)
-        self.wait_for("skip id=app-switch ")
-        self.assert_no_send("app-switch", seconds=1.1)
+        self.wait_for("would enter id=app-switch ")
+        self.assertNotIn("skip id=app-switch ", self.text())
 
     def test_mouse_click_cancels_only_when_it_changes_selection_or_focus(self):
         self.configure(delaySeconds=0.5)
@@ -167,30 +325,43 @@ class Runtime(unittest.TestCase):
         self.wait_for("would enter id=redundant-focus ")
         self.assertNotIn("skip id=redundant-focus ", self.text())
 
-    def test_notification_for_another_target_cancels_even_if_current_focus_has_returned(self):
-        self.configure(delaySeconds=0.5)
+    def test_notification_for_another_target_cancels_even_if_focus_has_returned(self):
+        self.configure(delaySeconds=2)
         self.start()
         for field, original in [("window", "window-1"), ("input", "input-1")]:
             with self.subTest(field=field):
                 identifier = f"notified-{field}"
                 self.complete(identifier)
-                self.wait_status(lambda status: status["pending"])
-                # The callback carries the earlier changed target, although
-                # reading current focus already returns the original target.
+                time.sleep(0.3)
                 self.event("focus_notification", **{field: "elsewhere"})
                 self.event("focus_notification", **{field: original})
-                self.wait_for(f"skip id={identifier} window/input focus changed")
-                self.assert_no_send(identifier, seconds=0.7)
+                self.wait_for(f"skip id={identifier} {DEPARTURE}", timeout=0.5)
+                self.assertNotIn(f"would enter id={identifier} ", self.text())
 
-    def test_focus_notification_still_cancels_when_current_focus_cannot_be_read(self):
+    def test_same_application_departure_during_paste_buffer_cancels_after_settlement(self):
+        self.configure(delaySeconds=2)
+        self.start(TYPELESS_TEST_MANUAL_SETTLE="1")
+        for field in ["window", "input"]:
+            with self.subTest(field=field):
+                self.event("focus", window="window-1", input="input-1")
+                identifier = f"buffer-{field}"
+                self.complete(identifier)
+                self.wait_pending_file()
+                self.event("focus", **{field: "elsewhere"})
+                self.assert_no_send(identifier, seconds=0.15)
+                self.event("settle")
+                self.wait_for(f"skip id={identifier} {DEPARTURE}", timeout=0.5)
+                self.assertNotIn(f"would enter id={identifier} ", self.text())
+
+    def test_unreadable_ax_content_is_not_editing_and_timeout_still_sends(self):
         self.configure(delaySeconds=0.5)
         self.start()
         self.complete("unreadable-notification")
-        self.wait_status(lambda status: status["pending"])
+        self.wait_pending_file()
+        time.sleep(0.3)
         self.event("focus_notification", input="input-1", focusReadable=False)
-        self.wait_for("skip id=unreadable-notification cannot verify focus notification: cannot inspect caret/focus")
-        self.event("capability", focusReadable=True)
-        self.assert_no_send("unreadable-notification", seconds=0.7)
+        self.wait_for("would enter id=unreadable-notification ")
+        self.assertNotIn("skip id=unreadable-notification ", self.text())
 
     def test_pause_cancels_pending_and_consumes_completed_rows(self):
         self.start()
@@ -394,35 +565,63 @@ class Runtime(unittest.TestCase):
         self.wait_for("would enter id=secure-ended ")
         self.assert_no_send("secure-input")
 
-    def test_typeless_injection_is_ignored_but_every_other_keyboard_event_cancels(self):
+    def test_keyboard_identity_never_cancels_unchanged_content(self):
         self.configure(delaySeconds=0.35)
         self.start()
-        self.complete("injected")
-        time.sleep(0.2)
-        self.event("keyboard", origin="typeless", key="v")
-        self.event("keyboard", origin="typeless-helper-verified", key="shift")
-        self.wait_for("would enter id=injected ")
-        for key in ["letter", "left-arrow", "shift", "control", "option", "command", "unknown-source"]:
+        for key in ["letter", "left-arrow", "shift", "control", "option", "command", "unknown-source", "fn"]:
             with self.subTest(key=key):
                 self.complete(key)
                 time.sleep(0.2)
                 self.event("keyboard", origin="unknown" if key == "unknown-source" else "physical", key=key)
-                self.wait_for(f"skip id={key} ")
-        time.sleep(0.6)
-        for key in ["letter", "left-arrow", "shift", "control", "option", "command", "unknown-source"]:
-            self.assertNotIn(f"would enter id={key} ", self.text())
+                self.wait_for(f"would enter id={key} ")
+                self.assertNotIn(f"skip id={key} ", self.text())
 
-    def test_window_and_input_switches_cancel_even_when_returned_before_next_poll(self):
+    def test_window_and_input_switches_cancel_before_the_countdown_expires(self):
+        self.configure(delaySeconds=2)
         self.start()
         for field, original in [("window", "window-1"), ("input", "input-1")]:
             with self.subTest(field=field):
                 self.complete(field)
-                time.sleep(0.25)
+                time.sleep(0.3)
                 self.event("focus", **{field: "elsewhere"})
                 self.event("focus", **{field: original})
-                self.wait_for(f"skip id={field} ")
-        time.sleep(1.2)
-        self.assertNotIn("would enter", self.text())
+                self.wait_for(f"skip id={field} {DEPARTURE}", timeout=0.5)
+                self.assertNotIn(f"would enter id={field} ", self.text())
+
+    def test_composer_departure_ignores_blurred_original_selection_reset(self):
+        self.configure(delaySeconds=2)
+        self.event("state", text="hello", caret=5)
+        self.start()
+        self.complete("composer-blur")
+        self.wait_pending_file()
+        time.sleep(0.3)
+        self.event("unnotified_state", caret=0)
+        self.event("focus", input="message-editor", text="other input", caret=0)
+        self.wait_for(f"skip id=composer-blur {DEPARTURE}", timeout=0.5)
+        self.assertNotIn("would enter id=composer-blur ", self.text())
+        skip = next(line for line in self.text().splitlines() if "skip id=composer-blur " in line)
+        self.assertNotIn("kind=", skip)
+
+    def test_deferred_cancellation_preserves_first_cause_in_daemon_log(self):
+        self.configure(delaySeconds=2)
+        self.event("state", text="hello", caret=5)
+        self.start(TYPELESS_TEST_DEFER_CANCEL_REPORT="1")
+        for kind, edit in [("content", {"text": "hello!"}), ("caret", {"caret": 2})]:
+            with self.subTest(kind=kind):
+                self.event("state", text="hello", caret=5)
+                identifier = f"deferred-{kind}"
+                self.complete(identifier)
+                self.wait_pending_file()
+                time.sleep(0.25)
+                self.event("state", **edit)
+                self.wait_for(f"skip id={identifier} ")
+                time.sleep(0.15)
+                lines = [line for line in self.text().splitlines() if f"skip id={identifier} " in line]
+                self.assertEqual(len(lines), 1)
+                self.assertIn(f"kind={kind}", lines[0])
+                self.assertIn(f"app={APP}", lines[0])
+                self.assertNotIn("attempt already consumed", lines[0])
+                self.assertNotIn(f"would enter id={identifier} ", self.text())
 
     def test_removing_app_cancels_pending_permanently(self):
         self.start()
@@ -439,7 +638,7 @@ class Runtime(unittest.TestCase):
         self.complete("original-delay")
         time.sleep(0.25)
         self.configure(delaySeconds=1.5)
-        self.wait_for("would enter id=original-delay ", timeout=0.6)
+        self.wait_for("would enter id=original-delay ", timeout=0.9)
         self.complete("next-delay")
         time.sleep(0.25)
         self.configure(delaySeconds=0)

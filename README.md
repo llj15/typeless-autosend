@@ -1,6 +1,6 @@
 # Typeless AutoSend
 
-A macOS command-line utility and login service for Apple Silicon (ARM). After Typeless finishes a transcription, it waits before pressing Return in an application you explicitly enabled. Any user keystroke or change of input focus cancels the pending send.
+A macOS command-line utility and login service for Apple Silicon (ARM). After Typeless finishes a transcription in an enabled application, it sends on application deactivation, an intercepted outside click, or countdown expiry. Editing the pasted text, moving its caret, or an already completed change of input focus cancels that send.
 
 ## Install from a Release (recommended)
 
@@ -62,20 +62,26 @@ typeless-autosend delay reset --app com.mitchellh.ghostty
 
 The default delay is **1 second**. Nonnegative fractional seconds are supported. An app override takes precedence; resetting it makes that app follow the global value again. Global `delay reset` restores 1 second.
 
-A fixed 150 ms paste buffer comes before the configured delay. A value of `0` removes the extra waiting period, not that buffer. Timing starts when the database completion is detected; Typeless has no official completion hook and this is not proof that pasting has finished.
+A fixed 150 ms paste buffer comes before the configured delay. A value of `0` removes the extra waiting period, not that buffer. Timing starts when the database completion is detected; Typeless has no official completion hook and this is not proof that pasting has finished. If Accessibility still reports the pre-paste value, settlement retries within a bounded window instead of immediately treating the cached value as a failed paste. Delivery waits for settlement, including with a zero delay.
 
-## Cancellation rules
+## Focus changes and cancellation
 
-During the wait:
+These rules apply only after a new Typeless completion schedules an automatic send in an enabled application. Ordinary typing without a pending send never causes Return.
 
-- Every real key press, including Fn and modifier keys, cancels this send permanently.
-- Switching applications, windows or input controls cancels it, even if the new application is also enabled.
-- A mouse click cancels it when the click changes the caret, selection or input focus. Clicking the same position without changing any of those does not cancel it. Moving the mouse or scrolling alone does not cancel it.
-- Starting another dictation with Fn cancels the old send immediately. When a new transcription completes, a new countdown can start; canceling or failing the dictation does not send the old text.
-- Cancellation is permanent for that attempt: returning focus or stopping typing does not restart it. Send manually or finish a new transcription.
-- If reliable focus/input inspection is unavailable, the service skips this attempt, records a reason, and checks again on the next transcription.
+- The service captures the original input immediately before Typeless pastes. After the 150 ms paste buffer, it identifies the lines containing the pasted text using the insertion point or the change between the before/after snapshots. If it cannot locate those lines, it compares the whole input instead.
+- Changes to the tracked lines cancel permanently. Refreshes elsewhere in a screen-sized input do not cancel a located region. Caret or selection changes also cancel while the original input is still focused and reports them. Selection resets caused by losing focus do not count as editing.
+- Keyboard events alone do not cancel or send. Clicking inside the original input keeps the countdown unless its content or selection changes. Its Accessibility ancestors and descendants count as the same input.
+- A confirmed outside click in the original application inserts Return into the same event-tap stream before releasing the click. The destination can be another input, a button or blank space. Separate branches under a known shared Accessibility ancestor prove that two controls are outside each other; unreadable ancestors above that point do not block this decision. An uncertain relationship does not trigger an early send.
+- Within a frontmost application, focus that has already moved to another window or input ends the attempt: PID delivery cannot select the original control after focus has changed, so Return would reach the new one. Countdown expiry also confirms the frontmost application still focuses the original input. Application deactivation still sends to the original PID without activating it, because the background application keeps its focused input. Intercepted mouse clicks use the ordered click path above. Departure compares the captured original input; confirmed content or caret editing still cancels.
+- A confirmed outside click during paste settlement is temporarily held, together with subsequent key, button, drag and scroll events, so focus stays in the original input. Successful settlement releases Return before the saved click; cancellation or a bounded timeout releases the saved input without Return. A late completion cannot revive a timed-out click. Non-mouse departures retain the existing PID delivery path.
+- Unreadable focus identity or text alone is not treated as editing. Expiry does not reread text or selection. See [implementation notes](docs/implementation-notes-leave-to-send.md) for the unit-test verification boundary of PID delivery.
+- A newer local database record cancels the pending attempt, including a new dictation whose status is still empty. This does not depend on a dictation shortcut.
+- If you stay in the original input, expiry sends without rereading its text or selection. The attempt must still be active and authorized, with a live original process, available permissions and Secure Input off.
+- Cancellation never resumes when focus returns. Pausing, disabling the app, permission loss, Secure Input, a listener interruption or the original app exiting cancels the attempt.
 
-Typeless-generated input is excluded only when it can be attributed to Typeless. Unattributed keyboard events cancel conservatively. Application Accessibility support varies; terminal editors or custom controls may not expose the caret information required to enable automatic sending. Redundant Accessibility focus notifications do not cancel when both the notified target and the current focus match the original target. A notification identifying another target still cancels, even if focus has already returned; unreadable focus also cancels.
+The service uses an active event tap on a dedicated thread. Click-triggered Return uses the current tap callback's stream; other departures and expiry retain PID delivery. AX requests use a 5 ms messaging timeout and an overall 25 ms software check budget. These are **not hard latency bounds**: macOS AX calls and the final config read can take longer, delaying an intercepted click.
+
+Accessibility support varies. Readable input text is needed to establish a baseline; controls without caret information use content alignment. Automated unit tests cover the region algorithm, simulated macOS events and dry-run sends without posting keys. They do not establish compatibility with every real application.
 
 ## Pause and inspect
 

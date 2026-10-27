@@ -49,13 +49,21 @@ let isoFrac: ISO8601DateFormatter = {
 }()
 let isoPlain = ISO8601DateFormatter()
 
-func log(_ msg: String) {
-    let ts = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime, .withFractionalSeconds])
+func log(_ msg: String, observedAt: Date = Date()) {
+    let ts = ISO8601DateFormatter.string(from: observedAt, timeZone: .current, formatOptions: [.withInternetDateTime, .withFractionalSeconds])
     print("[\(ts)] \(msg)")
     fflush(stdout)
 }
 
-struct Row { let id: String; let mode: String; let textLen: Int; let updatedAt: Date? }
+struct Row {
+    let sequence: Int64
+    let id: String
+    let mode: String
+    let status: String?
+    let refinedText: String
+    let textLen: Int
+    let updatedAt: Date?
+}
 struct FetchError: Error { let message: String }
 
 func columnString(_ stmt: OpaquePointer?, _ i: Int32) -> String? {
@@ -81,7 +89,7 @@ func tableColumns(_ db: OpaquePointer?) -> Set<String>? {
 
 // Failures (lock contention, incompatible schema, missing file, ...) are returned with a reason;
 // the caller retries on the next tick.
-func fetchRecentCompleted() -> Result<[Row], FetchError> {
+func fetchRecentLocalRows() -> Result<[Row], FetchError> {
     var db: OpaquePointer?
     guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
         let msg = sqliteMessage(db)
@@ -106,9 +114,9 @@ func fetchRecentCompleted() -> Result<[Row], FetchError> {
     // take up slots in the "most recent N" window; older versions without this column are not filtered.
     let local = columns.contains("synced_from_cloud") ? "synced_from_cloud = 0" : "1"
     let sql = """
-        SELECT id, mode, length(coalesce(refined_text, '')), updated_at FROM history_v2
-        WHERE rowid > (SELECT coalesce(max(rowid), 0) FROM history_v2 WHERE \(local)) - \(recentRowCount)
-          AND status = 'completed' AND \(local)
+        SELECT rowid, id, mode, status, coalesce(refined_text, ''), length(coalesce(refined_text, '')), updated_at
+        FROM history_v2 WHERE \(local)
+        ORDER BY rowid DESC LIMIT \(recentRowCount)
         """
     var stmt: OpaquePointer?
     guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -119,15 +127,57 @@ func fetchRecentCompleted() -> Result<[Row], FetchError> {
     var rows: [Row] = []
     while true {
         let rc = sqlite3_step(stmt)
-        if rc == SQLITE_DONE { return .success(rows) }
+        if rc == SQLITE_DONE { return .success(rows.reversed()) }
         guard rc == SQLITE_ROW else {
             return .failure(FetchError(message: "read failed: \(sqliteMessage(db))"))
         }
-        guard let id = columnString(stmt, 0) else { continue }
-        let updated = columnString(stmt, 3).flatMap { isoFrac.date(from: $0) ?? isoPlain.date(from: $0) }
-        rows.append(Row(id: id, mode: columnString(stmt, 1) ?? "",
-                        textLen: Int(sqlite3_column_int(stmt, 2)), updatedAt: updated))
+        guard let id = columnString(stmt, 1) else { continue }
+        let updated = columnString(stmt, 6).flatMap { isoFrac.date(from: $0) ?? isoPlain.date(from: $0) }
+        rows.append(Row(sequence: sqlite3_column_int64(stmt, 0), id: id,
+                        mode: columnString(stmt, 2) ?? "", status: columnString(stmt, 3),
+                        refinedText: columnString(stmt, 4) ?? "",
+                        textLen: Int(sqlite3_column_int(stmt, 5)), updatedAt: updated))
     }
+}
+
+// The event thread can send before the next database poll. Recheck the local row
+// boundary at that final authorization point too. A locked/unreadable database
+// denies the send without waiting on Typeless while an input event is blocked.
+func noNewerLocalDictation(after sequence: Int64) -> Bool {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        sqlite3_close(db)
+        return false
+    }
+    defer { sqlite3_close(db) }
+    guard let columns = tableColumns(db), requiredColumns.isSubset(of: columns) else { return false }
+    let local = columns.contains("synced_from_cloud") ? "synced_from_cloud = 0" : "1"
+    var stmt: OpaquePointer?
+    let sql = "SELECT EXISTS(SELECT 1 FROM history_v2 WHERE rowid > ? AND \(local))"
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+    defer { sqlite3_finalize(stmt) }
+    guard sqlite3_bind_int64(stmt, 1, sequence) == SQLITE_OK, sqlite3_step(stmt) == SQLITE_ROW else { return false }
+    return sqlite3_column_int(stmt, 0) == 0
+}
+
+// Bind a captured paste only after the latest local dictation is completed.
+// A late paste from an older transcript must not acquire the ID of a newer
+// recording whose placeholder is still incomplete; cloud history is excluded.
+func latestLocalRecordID() -> String? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        sqlite3_close(db)
+        return nil
+    }
+    defer { sqlite3_close(db) }
+    guard let columns = tableColumns(db), requiredColumns.isSubset(of: columns) else { return nil }
+    let local = columns.contains("synced_from_cloud") ? "synced_from_cloud = 0" : "1"
+    var stmt: OpaquePointer?
+    let sql = "SELECT id, status FROM history_v2 WHERE \(local) ORDER BY rowid DESC LIMIT 1"
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+    defer { sqlite3_finalize(stmt) }
+    guard sqlite3_step(stmt) == SQLITE_ROW, columnString(stmt, 1) == "completed" else { return nil }
+    return columnString(stmt, 0)
 }
 
 struct FileSig: Equatable { let mtime: Date?; let size: Int? }
@@ -189,16 +239,6 @@ func accessibilityTrusted(prompt: Bool = false) -> Bool {
     AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): prompt] as CFDictionary)
 }
 
-func pressEnter() {
-    let src = CGEventSource(stateID: .hidSystemState)
-    for down in [true, false] {
-        guard let ev = CGEvent(keyboardEventSource: src, virtualKey: 0x24, keyDown: down) else { continue }
-        // Clear leftover modifier flags such as Fn, otherwise fn+Return turns into keypad Enter.
-        ev.flags = []
-        ev.post(tap: .cghidEventTap)
-    }
-}
-
 // MARK: - Subcommands
 
 // includeAccessory: also list menu-bar and launcher apps (Raycast, Alfred, ...).
@@ -238,8 +278,8 @@ func runDoctor() -> Int32 {
         warn("Typeless.app not found (ignore this if it lives elsewhere)")
     }
 
-    switch fetchRecentCompleted() {
-    case .success(let rows): ok("Database readable, schema compatible (\(rows.count) recent completed records)")
+    switch fetchRecentLocalRows() {
+    case .success(let rows): ok("Database readable, schema compatible (\(rows.filter { $0.status == "completed" }.count) recent completed records)")
     case .failure(let error): fail("Database unavailable: \(error.message)")
     }
 
@@ -378,9 +418,12 @@ var tick = 0
 var enterPending = false
 var pendingGeneration = 0
 var pendingRowID: String?
+var pendingSequence: Int64?
+var awaitingPasteRetry = false
 var pendingFocus: FocusSnapshot?
 var pendingCancellationRevisions: (global: UInt64, app: UInt64)?
 let inputMonitor = InputMonitor(dryRun: dryRun, environment: env)
+inputMonitor.pasteRecordIDProvider = latestLocalRecordID
 var lastSkipReason: String?
 let runtimeStatusPath = URL(fileURLWithPath: configPath).deletingLastPathComponent().appendingPathComponent("runtime-status.json")
 
@@ -400,30 +443,66 @@ func recordSkip(_ id: String, _ reason: String) {
     writeRuntimeStatus()
 }
 
-func cancelPending(_ reason: String) {
-    guard enterPending, let id = pendingRowID else { return }
+func clearPendingState() {
     pendingGeneration += 1
     enterPending = false
     pendingRowID = nil
+    pendingSequence = nil
     pendingFocus = nil
     pendingCancellationRevisions = nil
-    inputMonitor.endAttempt()
-    recordSkip(id, reason)
+}
+
+func finishPendingSend() {
+    guard enterPending, let id = pendingRowID else { return }
+    let outcome = inputMonitor.endAttemptOutcome()
+    clearPendingState()
+    if let reason = outcome.sentReason { log("\(dryRun ? "would enter" : "enter") id=\(id) destination=\(reason)") }
+    else { recordSkip(id, outcome.cancellationReason ?? "attempt cancelled before send reporting") }
+    writeRuntimeStatus()
+}
+
+func cancelPending(_ reason: String) {
+    guard enterPending, let id = pendingRowID else { return }
+    // Atomically disarm or consume the send result. The event thread cannot
+    // deliver an old timer between our decision and cancellation.
+    let outcome = inputMonitor.endAttemptOutcome()
+    clearPendingState()
+    if let sentReason = outcome.sentReason {
+        log("\(dryRun ? "would enter" : "enter") id=\(id) destination=\(sentReason)")
+        writeRuntimeStatus()
+    } else { recordSkip(id, outcome.cancellationReason ?? reason) }
 }
 inputMonitor.onKeyboard = cancelPending
 inputMonitor.onFocusChange = cancelPending
 inputMonitor.onMonitoringChange = { log($0) }
+inputMonitor.onDiagnostic = { message in
+    // Capture observation time before dispatch: diagnostics must neither block
+    // the event tap on stdout nor inherit a later attempt's pending row ID.
+    let observedAt = Date()
+    DispatchQueue.main.async { log("input \(message)", observedAt: observedAt) }
+}
+inputMonitor.onSent = { _ in finishPendingSend() }
+
+func cancelSupersededPending(_ rows: [Row]) {
+    if let pending = pendingSequence, let latest = rows.max(by: { $0.sequence < $1.sequence }),
+       latest.sequence > pending {
+        cancelPending("superseded by newer local dictation")
+    }
+}
 
 func process(_ rows: [Row]) {
     guard var known = seen else {
-        seen = Set(rows.map(\.id))
-        log("baseline ready, \(rows.count) recent completed rows")
+        let completed = rows.filter { $0.status == "completed" }
+        seen = Set(completed.map(\.id))
+        log("baseline ready, \(completed.count) recent completed rows")
         return
     }
     defer { seen = known }
-    var scheduledThisBatch = false
+    awaitingPasteRetry = false
+    let newest = rows.max { $0.sequence < $1.sequence }
+    cancelSupersededPending(rows)
 
-    for row in rows where !known.contains(row.id) {
+    for row in rows where row.status == "completed" && !known.contains(row.id) {
         let age = row.updatedAt.map { Date().timeIntervalSince($0) }
         let ageText = age.map { String(format: "%.1fs", $0) } ?? "?"
         let fresh = age.map { abs($0) < freshnessSeconds } ?? false
@@ -445,6 +524,16 @@ func process(_ rows: [Row]) {
             recordSkip(row.id, "completed at or before input monitoring recovery")
             continue
         }
+        // A newer local row means another dictation has already started, even if
+        // its status is NULL. Never arm an older completion from this snapshot.
+        if let latest = newest, row.sequence < latest.sequence {
+            known.insert(row.id)
+            let reason = latest.status == "completed"
+                ? "coalesced into newer completed transcript"
+                : "superseded by newer local dictation"
+            recordSkip(row.id, reason)
+            continue
+        }
         // A record whose status turned completed before its text was written: while it is fresh, do not
         // consume it yet and wait for the text (a genuinely empty record is skipped as old once it goes stale).
         if fresh && row.textLen == 0 && pasteModes.contains(row.mode) { continue }
@@ -462,15 +551,16 @@ func process(_ rows: [Row]) {
         }
         if settings.apps.isEmpty { log("config has no apps, nothing enabled: \(configPath)") }
         if enterPending {
-            if scheduledThisBatch {
-                recordSkip(row.id, "coalesced into pending enter")
-                continue
-            }
-            cancelPending("superseded by newer completed transcript")
+            cancelPending("superseded by newer local dictation")
         }
         let focus: FocusSnapshot
-        switch inputMonitor.beginAttempt() {
-        case .failure(let error): recordSkip(row.id, error.reason); continue
+        switch inputMonitor.beginAttempt(recordID: row.id) {
+        case .failure(let error):
+            if error.reason == "awaiting Typeless paste" {
+                known.remove(row.id)
+                awaitingPasteRetry = true
+            } else { recordSkip(row.id, error.reason) }
+            continue
         case .success(let snapshot): focus = snapshot
         }
         // beginAttempt can recover a listener after a slow database read has
@@ -493,80 +583,82 @@ func process(_ rows: [Row]) {
             continue
         }
         enterPending = true
-        scheduledThisBatch = true
         pendingRowID = row.id
+        pendingSequence = row.sequence
         pendingFocus = focus
         let cancellationRevision = settings.cancellationRevision
         let appCancellationRevision = settings.appCancellationRevisions[normalizeBundleID(front)] ?? 0
         pendingCancellationRevisions = (cancellationRevision, appCancellationRevision)
-        inputMonitor.armAttempt(focus: focus)
+        inputMonitor.armAttempt(focus: focus, pastedText: row.refinedText, authorize: {
+            guard case .success(let latest) = readConfig(), !latest.paused,
+                  Set(latest.apps.map(normalizeBundleID)).contains(normalizeBundleID(front)),
+                  latest.cancellationRevision == cancellationRevision,
+                  (latest.appCancellationRevisions[normalizeBundleID(front)] ?? 0) == appCancellationRevision else { return false }
+            return noNewerLocalDictation(after: row.sequence)
+        })
+        if let token = inputMonitor.currentObservationToken {
+            log("input phase=armed id=\(row.id) epoch=\(token.epoch) app=\(focus.bundleID) pid=\(focus.processID)")
+        }
         pendingGeneration += 1
         let generation = pendingGeneration
         writeRuntimeStatus()
+        DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay) {
+            guard generation == pendingGeneration, enterPending else { return }
+            inputMonitor.settleAttempt()
+        }
         func deliverWhenSafe() {
             inputMonitor.poll()
-            inputMonitor.validateMouseSelection()
             guard generation == pendingGeneration, enterPending else { return }
-            guard inputMonitor.available else { cancelPending("input monitoring unavailable"); return }
-            if inputMonitor.mouseChecksPending > 0 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: deliverWhenSafe)
-                return
+            // A focus-event send may have consumed the attempt on the event thread
+            // while this main-loop callback was waiting for the lock.
+            if inputMonitor.sentAwaitingReport { return }
+            inputMonitor.deliver { sent in
+                guard generation == pendingGeneration, enterPending else { return }
+                if inputMonitor.sentAwaitingReport { finishPendingSend(); return }
+                guard sent else {
+                    cancelPending("original input changed, unavailable or sending no longer authorized")
+                    return
+                }
+                finishPendingSend()
             }
-            defer {
-                enterPending = false
-                pendingRowID = nil
-                pendingFocus = nil
-                pendingCancellationRevisions = nil
-                inputMonitor.endAttempt()
-                writeRuntimeStatus()
-            }
-            guard case .success(let current) = inputMonitor.currentFocus(), focus.sameTarget(as: current) else {
-                recordSkip(row.id, "window/input/application focus changed or unavailable")
-                return
-            }
-            guard case .success(let latest) = readConfig(), !latest.paused,
-                  Set(latest.apps.map(normalizeBundleID)).contains(normalizeBundleID(current.bundleID)) else {
-                recordSkip(row.id, "app removed, paused or config unavailable")
-                return
-            }
-            guard latest.cancellationRevision == cancellationRevision else {
-                recordSkip(row.id, "pause was requested during countdown")
-                return
-            }
-            guard (latest.appCancellationRevisions[normalizeBundleID(front)] ?? 0) == appCancellationRevision else {
-                recordSkip(row.id, "app was removed during countdown")
-                return
-            }
-            // Focus/config reads can take time. Recheck health without repairing
-            // immediately before posting, so a new observed outage cannot be hidden.
-            guard inputMonitor.available else {
-                recordSkip(row.id, "input monitoring unavailable before send")
-                return
-            }
-            if dryRun {
-                log("would enter id=\(row.id) mode=\(row.mode) len=\(row.textLen)")
-                return
-            }
-            guard AXIsProcessTrusted() else {
-                recordSkip(row.id, "accessibility not trusted")
-                return
-            }
-            pressEnter()
-            log("enter id=\(row.id) mode=\(row.mode) len=\(row.textLen)")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay + additionalDelay, execute: deliverWhenSafe)
     }
 }
 
+func pollDatabase() -> [Row]? {
+    // After persistent failures, drop to one retry per second instead of reopening the database
+    // and waiting on its lock every 100ms.
+    if failures >= persistentFailureCount && tick % 10 != 0 { return nil }
+
+    let sig = dbSignature()
+    guard seen == nil || awaitingPasteRetry || sig != lastSig else { return nil }
+    switch fetchRecentLocalRows() {
+    case .failure(let error):
+        failures += 1
+        if failures == persistentFailureCount { log("db read failing: \(error.message)") }
+        return nil
+    case .success(let rows):
+        if failures >= persistentFailureCount { log("db read recovered") }
+        failures = 0
+        lastSig = sig
+        return rows
+    }
+}
+
 let timer = Timer(timeInterval: pollInterval, repeats: true) { _ in
+    tick += 1
+    // Cancel old work before queued departure events can send it. Apply current
+    // input/permission events before binding any newly completed transcript.
+    let rows = pollDatabase()
+    if let rows { cancelSupersededPending(rows) }
     inputMonitor.poll()
-    inputMonitor.validateMouseSelection()
+    if let rows { process(rows) }
+    if enterPending, inputMonitor.sentAwaitingReport { finishPendingSend() }
     if enterPending, !inputMonitor.available { cancelPending("input monitoring unavailable") }
     if enterPending, let focus = pendingFocus {
-        switch inputMonitor.currentFocus() {
-        case .failure(let error): cancelPending(error.reason)
-        case .success(let current):
-            if !focus.sameTarget(as: current) { cancelPending("window/input/application focus changed") }
+        if !inputMonitor.sentAwaitingReport, case .failure(let error) = inputMonitor.validateAttempt() {
+            cancelPending(error.reason)
         }
         if case .success(let settings) = readConfig() {
             if settings.paused { cancelPending("autosend paused") }
@@ -583,7 +675,6 @@ let timer = Timer(timeInterval: pollInterval, repeats: true) { _ in
             }
         } else { cancelPending("config unavailable") }
     }
-    tick += 1
     if tick % 10 == 1 { writeRuntimeStatus() }
     // Check the permission state every 5 seconds and log a line when it changes
     // (doctor relies on this line to tell whether the background service has permission).
@@ -593,22 +684,6 @@ let timer = Timer(timeInterval: pollInterval, repeats: true) { _ in
             lastTrusted = trusted
             log("accessibility trusted=\(trusted) (changed)")
         }
-    }
-    // After persistent failures, drop to one retry per second instead of reopening the database
-    // and waiting on its lock every 100ms.
-    if failures >= persistentFailureCount && tick % 10 != 0 { return }
-
-    let sig = dbSignature()
-    guard seen == nil || sig != lastSig else { return }
-    switch fetchRecentCompleted() {
-    case .failure(let error):
-        failures += 1
-        if failures == persistentFailureCount { log("db read failing: \(error.message)") }
-    case .success(let rows):
-        if failures >= persistentFailureCount { log("db read recovered") }
-        failures = 0
-        lastSig = sig
-        process(rows)
     }
 }
 RunLoop.main.add(timer, forMode: .common)
