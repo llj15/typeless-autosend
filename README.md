@@ -1,6 +1,6 @@
 # Typeless AutoSend
 
-A macOS command-line utility and login service for Apple Silicon (ARM). After Typeless finishes a transcription, it waits before pressing Return in an application you explicitly enabled. A pending send follows the original input across application switches, with conservative checks before sending.
+A macOS command-line utility and login service for Apple Silicon (ARM). After Typeless finishes a transcription, it waits before pressing Return in an application you explicitly enabled. Any user keystroke or change of input focus cancels the pending send.
 
 ## Install from a Release (recommended)
 
@@ -64,21 +64,18 @@ The default delay is **1 second**. Nonnegative fractional seconds are supported.
 
 A fixed 150 ms paste buffer comes before the configured delay. A value of `0` removes the extra waiting period, not that buffer. Timing starts when the database completion is detected; Typeless has no official completion hook and this is not proof that pasting has finished.
 
-## Focus changes and cancellation
+## Cancellation rules
 
-These rules apply only after a new Typeless completion schedules an automatic send in an enabled application. Ordinary typing without a pending send never causes Return.
+During the wait:
 
-- Switching to another application keeps the original deadline. At expiry the service checks the original application's PID, AX window, input object, text and selection, then posts Return to that PID without activating it. Keys and text edits in the other application do not cancel the original send.
-- While the original application is still frontmost, a verified left click on a distinct, enabled text field or text area can send before the original click is released. Both controls must have separate Accessibility ancestry ending in a window, and the target must support focus. This also covers another window in the same application when those checks succeed. There is no focus restoration or fixed waiting period.
-- Plain, non-repeated Tab can send first only from an Accessibility single-line `AXTextField` with an ASCII-capable keyboard input source. Multiline/custom editors, IME input sources, modified Tab and uncertain navigation cancel conservatively. Applications can customize Tab behavior; this restricted classification is not a compatibility guarantee.
-- Clicking the original input, buttons, combo boxes, ambiguous composite controls, or an unreadable target cancels. Activating the original application from another application keeps the deadline rather than injecting Return ahead of activation. Programmatic focus changes without a verified intercepted input event cancel.
-- Editing the original input, moving its caret or changing its selection cancels permanently. Physical editing keys, Return/newline, modified navigation and Fn also cancel while the original application is frontmost. Modifier changes alone do not edit text; Command-Tab preserves the countdown.
-- The existing 150 ms paste buffer must finish before an early send is allowed. During it, attributed Typeless paste changes can settle; user editing still cancels. A transition before the buffer ends cancels. Starting another dictation with Fn cancels the old attempt; a later completion can start a new one.
-- Cancellation never resumes when focus returns. Permission loss, Secure Input, missed input during an inspection, unresponsive AX, missing content/selection notifications, app exit or unreadable original state skips the attempt.
+- Every real key press, including Fn and modifier keys, cancels this send permanently.
+- Switching applications, windows or input controls cancels it, even if the new application is also enabled.
+- A mouse click cancels it when the click changes the caret, selection or input focus. Clicking the same position without changing any of those does not cancel it. Moving the mouse or scrolling alone does not cancel it.
+- Starting another dictation with Fn cancels the old send immediately. When a new transcription completes, a new countdown can start; canceling or failing the dictation does not send the old text.
+- Cancellation is permanent for that attempt: returning focus or stopping typing does not restart it. Send manually or finish a new transcription.
+- If reliable focus/input inspection is unavailable, the service skips this attempt, records a reason, and checks again on the next transcription.
 
-The service uses an active event tap on a dedicated thread. It passes the original switching event through after inserting a single Return pair. AX requests use a 5 ms messaging timeout and an overall 25 ms software check budget; overruns cancel sending. These are **not hard latency bounds**: macOS AX calls and the final config read can take longer, delaying that original event. The service never promises zero added latency.
-
-Accessibility support varies. Both content and selection notifications, readable text and selection ranges are required; applications previously usable with focus-only inspection may now skip. Unsupported controls and uncertain transitions cancel rather than guessing. The automated runtime tests simulate macOS state and never post keys; owned AppKit experiments establish event ordering and background PID delivery only, not compatibility with every chat application.
+Typeless-generated input is excluded only when it can be attributed to Typeless. Unattributed keyboard events cancel conservatively. Application Accessibility support varies; terminal editors or custom controls may not expose the caret information required to enable automatic sending. Redundant Accessibility focus notifications do not cancel when both the notified target and the current focus match the original target. A notification identifying another target still cancels, even if focus has already returned; unreadable focus also cancels.
 
 ## Pause and inspect
 
