@@ -22,7 +22,13 @@ def run(front, cases):
     if os.path.exists(cfg):
         os.remove(cfg)
     p = start(BIN, db, log, cfg=cfg, fake_front=front)
-    time.sleep(1)
+    deadline = time.monotonic() + 10
+    while "baseline ready" not in text(log):
+        if p.poll() is not None or time.monotonic() >= deadline:
+            stop(p)
+            conn.close()
+            raise AssertionError(f"daemon did not become ready: {text(log)}")
+        time.sleep(0.02)
     for name, content, _ in cases:
         if content is None:
             if os.path.exists(cfg):
