@@ -71,7 +71,7 @@ During the wait:
 - Every real key press, including Fn and modifier keys, cancels this send permanently.
 - Switching applications, windows or input controls cancels it, even if the new application is also enabled.
 - A mouse click cancels it when the click changes the caret, selection or input focus. Clicking the same position without changing any of those does not cancel it. Moving the mouse or scrolling alone does not cancel it.
-- Starting another dictation with Fn cancels the old send immediately. When a new transcription completes, a new countdown can start; canceling or failing the dictation does not send the old text.
+- Starting another dictation with your keyboard shortcut (Fn or a custom key combination) cancels the old send immediately. When a new transcription completes, a new countdown can start; canceling or failing the dictation does not send the old text.
 - Cancellation is permanent for that attempt: returning focus or stopping typing does not restart it. Send manually or finish a new transcription.
 - If reliable focus/input inspection is unavailable, the service skips this attempt, records a reason, and checks again on the next transcription.
 
