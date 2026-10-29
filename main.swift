@@ -477,18 +477,21 @@ func process(_ rows: [Row]) {
         // crossed the retry deadline, so use the latest recovery boundary too.
         if let recoveredAfter = inputMonitor.recoveredAfter, let completedAt = row.updatedAt,
            completedAt <= recoveredAfter {
+            inputMonitor.endAttempt()
             recordSkip(row.id, "completed at or before input monitoring recovery")
             continue
         }
         let front = focus.bundleID
         let isTarget = Set(settings.apps.map(normalizeBundleID)).contains(normalizeBundleID(front))
         guard isTarget else {
+            inputMonitor.endAttempt()
             recordSkip(row.id, "front=\(front) not in whitelist")
             continue
         }
         let additionalDelay = settings.effectiveDelay(for: front)
         guard additionalDelay.isFinite, additionalDelay >= 0,
               additionalDelay <= maximumDelaySeconds else {
+            inputMonitor.endAttempt()
             recordSkip(row.id, "configured delay exceeds scheduler range")
             continue
         }
