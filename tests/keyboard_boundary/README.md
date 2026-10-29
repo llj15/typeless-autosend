@@ -21,3 +21,14 @@ FAIL: starting Fn dictation must cancel a pending send even when the dictation c
 This simulation verifies routing policy and cancellation, not actual physical Fn
 delivery on a particular macOS installation. Live physical verification remains
 separate.
+
+Second slice: ordered head/tail routing now honors consumer suppression and
+listen-only forwarding. Fixture retains ports, skips invalidated ports, and
+uses deterministic read-only AX/AppKit boundaries for successful public
+`beginAttempt()` -> `armAttempt(focus:)` flow. `consumer-after-daemon` installs a
+consumer after daemon construction and before beginning the attempt.
+
+Both scenarios fail on `72c2833` and pass with production `861c684`.
+A temporary build of `861c684` omitting only its beginAttempt rehead guard fails
+`consumer-after-daemon` (exit 1), confirming sensitivity to the ordering fix.
+No production source file was edited for that mutation experiment.

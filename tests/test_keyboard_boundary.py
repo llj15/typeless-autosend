@@ -14,13 +14,15 @@ work.mkdir(parents=True, exist_ok=True)
 library = work / "libKeyboardBoundary.dylib"
 binary = work / "keyboard-boundary"
 subprocess.run([
-    "clang", "-dynamiclib", str(source / "coregraphics.c"), "-o", str(library),
-    "-framework", "ApplicationServices", "-framework", "Carbon",
+    "clang", "-dynamiclib", str(source / "coregraphics.m"), "-o", str(library),
+    "-framework", "ApplicationServices", "-framework", "Carbon", "-framework", "AppKit",
 ], check=True)
 subprocess.run([
     "swiftc", *(str(path) for path in sorted(Path(ROOT).glob("*.swift")) if path.name != "main.swift"),
     str(source / "main.swift"), "-L", str(work), "-lKeyboardBoundary",
     "-Xlinker", "-rpath", "-Xlinker", str(work), "-o", str(binary), "-lsqlite3",
 ], check=True)
-result = subprocess.run([str(binary)], env=dict(os.environ, DYLD_INSERT_LIBRARIES=str(library)))
-raise SystemExit(result.returncode)
+for scenario in ("fn", "consumer-after-daemon"):
+    result = subprocess.run([str(binary), scenario], env=dict(os.environ, DYLD_INSERT_LIBRARIES=str(library)))
+    if result.returncode:
+        raise SystemExit(result.returncode)
