@@ -371,14 +371,18 @@ final class InputMonitor {
         var prepared = false
         defer { if !prepared { preparedHardwareConsumers = nil } }
         guard available else { return .failure(InputMonitorError(reason: "input monitoring unavailable: \(monitoringState.unavailableReason ?? "unknown")")) }
+        let consumersBeforeRefresh = dryRun ? nil : hardwareConsumers()
+        if !dryRun, consumersBeforeRefresh == nil {
+            return .failure(InputMonitorError(reason: "cannot inspect dictation shortcut consumers"))
+        }
         // Typeless may have installed a consuming HID tap after this daemon started.
         // Put our passive listener ahead of it before every new countdown.
         if !dryRun, !refreshHardwareTap() {
             return .failure(InputMonitorError(reason: "cannot monitor dictation shortcut before interception"))
         }
         if !dryRun {
-            guard let consumers = hardwareConsumers() else {
-                return .failure(InputMonitorError(reason: "cannot inspect dictation shortcut consumers"))
+            guard let consumers = hardwareConsumers(), consumers == consumersBeforeRefresh else {
+                return .failure(InputMonitorError(reason: "dictation shortcut consumers changed during preparation"))
             }
             preparedHardwareConsumers = consumers
         }
