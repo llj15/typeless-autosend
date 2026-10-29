@@ -1,6 +1,7 @@
 import Foundation
 
 @_silgen_name("install_dictation_consumer") func installDictationConsumer()
+@_silgen_name("set_enumeration_failure") func setEnumerationFailure(_ fail: Int32)
 @_silgen_name("set_hid_creation_failure") func setHIDCreationFailure(_ fail: Int32)
 @_silgen_name("interrupt_listener") func interruptListener(_ hid: Int32, _ invalidate: Int32)
 @_silgen_name("emit_keyboard") func emitKeyboard(_ sessionOnly: Int32, _ custom: Int32)
@@ -31,6 +32,18 @@ guard case .success(let focus) = monitor.beginAttempt() else {
     exit(2)
 }
 monitor.armAttempt(focus: focus)
+if scenario == "enumeration-failure" {
+    setEnumerationFailure(1)
+    guard !monitor.available else {
+        fputs("FAIL: failed routing inspection must block unsafe sending\n", stderr); exit(1)
+    }
+    monitor.poll()
+    guard !cancellationReasons.isEmpty else {
+        fputs("FAIL: failed routing inspection must notify cancellation\n", stderr); exit(1)
+    }
+    print("PASS: failed routing inspection blocks sending and cancels the old attempt")
+    exit(0)
+}
 if scenario == "consumer-after-arm" {
     installDictationConsumer()
     emitKeyboard(0, 0)

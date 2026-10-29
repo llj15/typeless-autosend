@@ -22,7 +22,7 @@ subprocess.run([
     str(source / "main.swift"), "-L", str(work), "-lKeyboardBoundary",
     "-Xlinker", "-rpath", "-Xlinker", str(work), "-o", str(binary), "-lsqlite3",
 ], check=True)
-for scenario in ("fn", "consumer-after-daemon", "custom", "session", "hid-create-failure", "hid-timeout", "hid-invalid", "session-timeout", "session-invalid", "consumer-after-arm"):
+for scenario in ("fn", "consumer-after-daemon", "custom", "session", "hid-create-failure", "hid-timeout", "hid-invalid", "session-timeout", "session-invalid", "consumer-after-arm", "enumeration-failure"):
     result = subprocess.run([str(binary), scenario], env=dict(os.environ, DYLD_INSERT_LIBRARIES=str(library)))
     if result.returncode:
         raise SystemExit(result.returncode)

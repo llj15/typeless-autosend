@@ -58,3 +58,34 @@ reaches the monitor. Public health must therefore block the old send and poll
 must notify cancellation when persistent routing changed. The CGGetEventTapList
 fixture reports retained, valid system registrations with stable IDs, options,
 masks and enabled status. Product assertions do not inspect IDs or tap placement.
+
+Topology GREEN: all ten scenarios pass with production `e260ec0`.
+The essential `enumeration-failure` case then verifies failed OS routing inspection
+blocks public health and poll notifies cancellation. It fails against `861c684`
+with `FAIL: failed routing inspection must block unsafe sending` (exit 1), and
+passes with `e260ec0`. All eleven scenarios pass together.
+
+## Harness quality and limits
+
+- Exercises actual production InputMonitor initialization, event masks/callbacks,
+  source attribution, begin/arm, health queries, interruption and poll recovery.
+  Assertions use public cancellation callbacks, availability and attempt result.
+- Models per-level head/tail insertion, enabled/valid port gating, active consumer
+  suppression, and listen-only callbacks being unable to suppress the event.
+  Ports have fixture ownership until process exit, including retired invalid ports.
+- All tap creation is interposed to local Mach ports. Events are constructed in
+  memory and dispatched to captured callbacks; they are never posted. CGEventPost
+  aborts if reached. Test focus uses deterministic read-only AX/AppKit stubs.
+  Tests do not launch dictation, type text/Return, change installed services, or
+  open transcript databases. Production main.swift is excluded from this binary.
+- System simulation assumes macOS tap ordering/consumption semantics. It cannot
+  establish physical Fn delivery, actual TCC permissions, real application focus,
+  event-tap scheduling/timeouts, or Typeless behavior on the user's machine.
+  Source attribution executes with PID 0 (unknown/physical); verified Typeless
+  synthetic-paste exemption is not established by this boundary suite.
+- The restart case covers a persistent new consuming HID keyboard filter visible
+  in the OS tap list. An invisible transient filter is outside this guarantee.
+  Event replacement by a non-suppressing active filter is not modeled.
+- The fixture is macOS-specific and requires CLT Swift/Clang/AppKit, matching the
+  application. Recovery includes a bounded real-time retry wait (up to 2 seconds).
+  Each scenario runs in its own process, isolating swizzles and fixture state.
