@@ -26,6 +26,7 @@ static int listener_count;
 static uint32_t next_identifier = 1;
 static bool fail_enumeration;
 static bool fail_hid_create;
+static bool install_during_enumeration;
 static void receive_message(CFMachPortRef port, void *message, CFIndex size, void *context) {}
 static CFMachPortRef simulated_create(CGEventTapLocation location, CGEventTapPlacement placement,
     CGEventTapOptions options, CGEventMask mask, CGEventTapCallBack callback, void *context) {
@@ -142,6 +143,7 @@ void interrupt_listener(int hid, int invalidate) {
 }
 
 static CGError simulated_tap_list(uint32_t maximum, CGEventTapInformation *information, uint32_t *count) {
+    if (install_during_enumeration) { install_during_enumeration = false; install_dictation_consumer(); }
     if (fail_enumeration) return kCGErrorFailure;
     uint32_t active = 0;
     for (int i = 0; i < listener_count; i++) {
@@ -162,3 +164,5 @@ static CGError simulated_tap_list(uint32_t maximum, CGEventTapInformation *infor
 }
 INTERPOSE(simulated_tap_list, CGGetEventTapList)
 void set_enumeration_failure(int value) { fail_enumeration = value; }
+
+void set_install_during_enumeration(int value) { install_during_enumeration = value; }

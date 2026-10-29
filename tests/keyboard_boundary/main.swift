@@ -1,6 +1,7 @@
 import Foundation
 
 @_silgen_name("install_dictation_consumer") func installDictationConsumer()
+@_silgen_name("set_install_during_enumeration") func setInstallDuringEnumeration(_ value: Int32)
 @_silgen_name("set_enumeration_failure") func setEnumerationFailure(_ fail: Int32)
 @_silgen_name("set_hid_creation_failure") func setHIDCreationFailure(_ fail: Int32)
 @_silgen_name("interrupt_listener") func interruptListener(_ hid: Int32, _ invalidate: Int32)
@@ -27,11 +28,23 @@ if scenario == "hid-create-failure" {
 var cancellationReasons: [String] = []
 monitor.onKeyboard = { cancellationReasons.append($0) }
 if scenario == "consumer-after-daemon" { installDictationConsumer() }
+if scenario == "consumer-during-preparation" { setInstallDuringEnumeration(1) }
 guard case .success(let focus) = monitor.beginAttempt() else {
+    if scenario == "consumer-during-preparation" { print("PASS: unsafe preparation refused"); exit(0) }
     fputs("fixture error: public beginAttempt failed\n", stderr)
     exit(2)
 }
 monitor.armAttempt(focus: focus)
+if scenario == "consumer-during-preparation" {
+    emitKeyboard(0, 0)
+    let healthBeforePoll = monitor.available
+    monitor.poll()
+    guard !healthBeforePoll || !monitor.available || !cancellationReasons.isEmpty else {
+        fputs("FAIL: consumer installed during preparation swallowed Fn while pending send stayed healthy\n", stderr); exit(1)
+    }
+    print("PASS: changed routing during preparation blocks the unsafe attempt")
+    exit(0)
+}
 if scenario == "enumeration-failure" {
     setEnumerationFailure(1)
     guard !monitor.available else {
