@@ -43,3 +43,18 @@ Additional routing/health coverage (no further production changes):
 Health assertions use public `available`, `beginAttempt`, `poll`, and cancellation
 callbacks. Recovery must restore monitoring while notifying cancellation of the
 old attempt. Creation-failure recovery observes the existing bounded retry delay.
+
+Persistent restart slice RED against `861c684`:
+
+```text
+$ python3 tests/test_keyboard_boundary.py
+[nine existing scenarios PASS]
+FAIL: persistent dictation consumer installed during countdown must block unsafe sending
+(exit 1)
+```
+
+The added consumer is installed after public begin/arm. Its swallowed Fn never
+reaches the monitor. Public health must therefore block the old send and poll
+must notify cancellation when persistent routing changed. The CGGetEventTapList
+fixture reports retained, valid system registrations with stable IDs, options,
+masks and enabled status. Product assertions do not inspect IDs or tap placement.

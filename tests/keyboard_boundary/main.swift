@@ -31,6 +31,19 @@ guard case .success(let focus) = monitor.beginAttempt() else {
     exit(2)
 }
 monitor.armAttempt(focus: focus)
+if scenario == "consumer-after-arm" {
+    installDictationConsumer()
+    emitKeyboard(0, 0)
+    guard !monitor.available else {
+        fputs("FAIL: persistent dictation consumer installed during countdown must block unsafe sending\n", stderr); exit(1)
+    }
+    monitor.poll()
+    guard !cancellationReasons.isEmpty else {
+        fputs("FAIL: changed shortcut routing must notify cancellation of the old attempt\n", stderr); exit(1)
+    }
+    print("PASS: restarted dictation consumer during countdown cancels the old attempt")
+    exit(0)
+}
 if scenario.hasSuffix("timeout") || scenario.hasSuffix("invalid") {
     let invalid = scenario.hasSuffix("invalid")
     interruptListener(scenario.hasPrefix("hid") ? 1 : 0, invalid ? 1 : 0)

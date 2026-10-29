@@ -19,9 +19,12 @@ typedef struct {
     CFMachPortRef port;
     CGEventTapOptions options;
     bool enabled;
+    uint32_t identifier;
 } Listener;
 static Listener listeners[128];
 static int listener_count;
+static uint32_t next_identifier = 1;
+static bool fail_enumeration;
 static bool fail_hid_create;
 static void receive_message(CFMachPortRef port, void *message, CFIndex size, void *context) {}
 static CFMachPortRef simulated_create(CGEventTapLocation location, CGEventTapPlacement placement,
@@ -35,7 +38,7 @@ static CFMachPortRef simulated_create(CGEventTapLocation location, CGEventTapPla
     CFRetain(port);
     int index = placement == kCGHeadInsertEventTap ? 0 : listener_count;
     for (int i = listener_count; i > index; i--) listeners[i] = listeners[i - 1];
-    listeners[index] = (Listener){location, mask, callback, context, port, options, true};
+    listeners[index] = (Listener){location, mask, callback, context, port, options, true, next_identifier++};
     listener_count++;
     return port;
 }
@@ -137,3 +140,25 @@ void interrupt_listener(int hid, int invalidate) {
         }
     }
 }
+
+static CGError simulated_tap_list(uint32_t maximum, CGEventTapInformation *information, uint32_t *count) {
+    if (fail_enumeration) return kCGErrorFailure;
+    uint32_t active = 0;
+    for (int i = 0; i < listener_count; i++) {
+        Listener listener = listeners[i];
+        if (!CFMachPortIsValid(listener.port)) continue;
+        if (information && active < maximum) {
+            information[active] = (CGEventTapInformation){
+                .eventTapID = listener.identifier, .tapPoint = listener.location,
+                .options = listener.options, .eventsOfInterest = listener.mask,
+                .tappingProcess = listener.callback == consume ? 424242 : getpid(),
+                .enabled = listener.enabled
+            };
+        }
+        active++;
+    }
+    if (count) *count = active;
+    return kCGErrorSuccess;
+}
+INTERPOSE(simulated_tap_list, CGGetEventTapList)
+void set_enumeration_failure(int value) { fail_enumeration = value; }
