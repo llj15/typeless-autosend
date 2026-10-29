@@ -32,3 +32,14 @@ Both scenarios fail on `72c2833` and pass with production `861c684`.
 A temporary build of `861c684` omitting only its beginAttempt rehead guard fails
 `consumer-after-daemon` (exit 1), confirming sensitivity to the ordering fix.
 No production source file was edited for that mutation experiment.
+
+Additional routing/health coverage (no further production changes):
+
+- Swallowed custom Cmd+Shift+K: baseline RED, `861c684` GREEN.
+- Session-origin keyboard: baseline and `861c684` GREEN.
+- HID creation failure, timeout and invalidation: baseline RED, `861c684` GREEN.
+- Session timeout/invalidation: baseline and `861c684` GREEN.
+
+Health assertions use public `available`, `beginAttempt`, `poll`, and cancellation
+callbacks. Recovery must restore monitoring while notifying cancellation of the
+old attempt. Creation-failure recovery observes the existing bounded retry delay.
