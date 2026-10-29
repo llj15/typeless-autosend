@@ -35,6 +35,7 @@ private struct InputMonitoringState: Equatable {
     var tapValid = true
     var sourcePresent = true
     var tapEnabled = true
+    var topologyReason: String?
 
     var unavailableReason: String? {
         if !permissionGranted { return "listen_permission_denied" }
@@ -43,6 +44,7 @@ private struct InputMonitoringState: Equatable {
         if !tapValid { return "tap_invalid" }
         if !sourcePresent { return "tap_source_missing" }
         if !tapEnabled { return "tap_disabled" }
+        if let topologyReason { return topologyReason }
         return nil
     }
 }
@@ -60,6 +62,7 @@ final class InputMonitor {
     private var tapSource: CFRunLoopSource?
     private var hardwareTap: CFMachPort?
     private var hardwareTapSource: CFRunLoopSource?
+    private var preparedHardwareConsumers: Set<UInt32>?
     private var activationObserver: NSObjectProtocol?
     private var focusObserver: AXObserver?
     private var simulatedFocus: FocusSnapshot
@@ -78,7 +81,7 @@ final class InputMonitor {
     private(set) var recoveredAfter: Date?
     private(set) var recoveryAttempts = 0
     private var monitoringState: InputMonitoringState {
-        let state: InputMonitoringState
+        var state: InputMonitoringState
         if dryRun { state = simulatedMonitoring }
         else {
             state = InputMonitoringState(permissionGranted: CGPreflightListenEventAccess(),
@@ -88,6 +91,11 @@ final class InputMonitor {
                     $0.map { CFRunLoopSourceIsValid($0) && CFRunLoopContainsSource(CFRunLoopGetMain(), $0, .commonModes) } ?? false
                 },
                 tapEnabled: [tap, hardwareTap].allSatisfy { $0.map { CGEvent.tapIsEnabled(tap: $0) } ?? false })
+        }
+        if !dryRun, let preparedHardwareConsumers {
+            if let current = hardwareConsumers() {
+                if current != preparedHardwareConsumers { state.topologyReason = "keyboard_tap_topology_changed" }
+            } else { state.topologyReason = "keyboard_tap_topology_unavailable" }
         }
         // Even a health-only check before sending must remember an observed
         // gap if the OS recovers before the next recovery poll.
@@ -188,6 +196,25 @@ final class InputMonitor {
         return true
     }
 
+    private func hardwareConsumers() -> Set<UInt32>? {
+        var count: UInt32 = 0
+        guard CGGetEventTapList(0, nil, &count) == .success, count <= 4096 else { return nil }
+        // Leave spare capacity for concurrent registrations; a full result might
+        // be truncated, so reject it instead of accepting an incomplete snapshot.
+        let capacity = min(4096, max(16, Int(count) + 16))
+        var taps = [CGEventTapInformation](repeating: CGEventTapInformation(), count: capacity)
+        guard CGGetEventTapList(UInt32(capacity), &taps, &count) == .success,
+              count < UInt32(capacity) else { return nil }
+        let keyboardMask = [CGEventType.keyDown, .keyUp, .flagsChanged].reduce(CGEventMask(0)) {
+            $0 | (CGEventMask(1) << $1.rawValue)
+        }
+        return Set(taps.prefix(Int(count)).filter {
+            $0.tapPoint == .cghidEventTap && $0.enabled
+                && $0.options.rawValue & CGEventTapOptions.listenOnly.rawValue == 0
+                && $0.eventsOfInterest & keyboardMask != 0
+        }.map(\.eventTapID))
+    }
+
     private func removeTap() {
         if dryRun {
             simulatedMonitoring.tapPresent = false
@@ -229,6 +256,10 @@ final class InputMonitor {
         // Every observed gap cancels the old attempt before any operation can
         // make the listener appear healthy again. Recovery never resumes it.
         guard state.permissionGranted, !state.secureInputEnabled else { return }
+        // A replacement consumer can swallow a shortcut while our taps remain
+        // healthy. Keep the old attempt blocked until it ends or is prepared anew;
+        // rebuilding healthy taps here would hide that missed-input window.
+        if state.topologyReason != nil && state.tapPresent && state.tapValid && state.sourcePresent && state.tapEnabled { return }
         let now = ProcessInfo.processInfo.systemUptime
         guard now >= nextRecoveryAt else { return }
         nextRecoveryAt = now + 1
@@ -312,6 +343,7 @@ final class InputMonitor {
     }
 
     func endAttempt() {
+        preparedHardwareConsumers = nil
         attemptEpoch += 1
         attemptActive = false
         mouseChecksPending = 0
@@ -334,16 +366,27 @@ final class InputMonitor {
 
     func beginAttempt() -> Result<FocusSnapshot, InputMonitorError> {
         recoverMonitoringIfNeeded()
+        preparedHardwareConsumers = nil
+        if observedMonitoringGap { recoverMonitoringIfNeeded() }
+        var prepared = false
+        defer { if !prepared { preparedHardwareConsumers = nil } }
         guard available else { return .failure(InputMonitorError(reason: "input monitoring unavailable: \(monitoringState.unavailableReason ?? "unknown")")) }
         // Typeless may have installed a consuming HID tap after this daemon started.
         // Put our passive listener ahead of it before every new countdown.
         if !dryRun, !refreshHardwareTap() {
             return .failure(InputMonitorError(reason: "cannot monitor dictation shortcut before interception"))
         }
+        if !dryRun {
+            guard let consumers = hardwareConsumers() else {
+                return .failure(InputMonitorError(reason: "cannot inspect dictation shortcut consumers"))
+            }
+            preparedHardwareConsumers = consumers
+        }
         let result = currentFocus()
         if !dryRun, case .success(let snapshot) = result, !observeFocus(pid: snapshot.processID) {
             return .failure(InputMonitorError(reason: "focus notifications unavailable"))
         }
+        if case .success = result { prepared = true }
         return result
     }
 

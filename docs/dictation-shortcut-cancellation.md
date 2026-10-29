@@ -31,3 +31,11 @@ The tests agent owns the first behavioral regression and records baseline failur
 4. Run existing regression suites and independent code review; address material findings before installing.
 
 A preliminary untested candidate was saved outside the repository before the user requested TDD. It is not part of this baseline and is not evidence of a fix.
+
+## Listener routing and restart boundary
+
+The listener observes keyboard activity through passive HID and session taps. Before preparing each countdown it inserts a new HID listener ahead of existing taps, then retires its previous HID listener. The session listener remains responsible for events delivered at session level and for mouse activity. Both listeners must remain healthy.
+
+Preparation captures the IDs of enabled active HID taps interested in keyboard events. During a prepared or armed attempt, the existing poll and final pre-send health checks compare the current set with that snapshot. A persistent addition, removal, or replacement makes the attempt unavailable and cancels it; enumeration errors and potentially truncated results also fail closed. The comparison does not rely on event-tap list order. A topology mismatch alone does not rebuild healthy listeners or silently accept a new baseline. Ended and failed preparations clear their snapshot; a later preparation reclaims the HID head and captures a fresh snapshot.
+
+Enumeration is bounded to 4096 entries and runs only for preparation or while a prepared snapshot exists. An entirely transient consumer installed and removed between checks can escape this comparison. There is also an unavoidable interval between the final health check and posting Return. These snapshots establish protection against persistent consumer restarts or re-registration during the countdown, not an atomic guarantee across all macOS event-routing changes. Physical Fn delivery still requires separate native verification.
