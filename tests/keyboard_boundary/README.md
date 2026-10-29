@@ -89,3 +89,27 @@ passes with `e260ec0`. All eleven scenarios pass together.
 - The fixture is macOS-specific and requires CLT Swift/Clang/AppKit, matching the
   application. Recovery includes a bounded real-time retry wait (up to 2 seconds).
   Each scenario runs in its own process, isolating swizzles and fixture state.
+
+## Review repair regressions
+
+`consumer-during-preparation` reproduces a filter installed during preparation's
+first OS enumeration. It was RED on `e260ec0`; `d9ec4cc` makes all twelve boundary
+cases GREEN by safely preparing ahead of the consumer or refusing unsafe setup.
+
+`python3 tests/test_keyboard_daemon_boundary.py` compiles the complete unchanged
+daemon entry point and interposes macOS APIs. Config, executable lock/runtime
+state, HOME and SQLite all live in a temporary directory. It waits for explicit
+`fixture: isolated macOS boundary loaded` and production baseline readiness.
+The fake front app is rejected by the first config. After that production skip,
+a marker makes the boundary install a persistent consumer during idle polling.
+A new fresh completion with the fake app enabled must send normally.
+
+RED on `d9ec4cc`: first row correctly skips whitelist; topology becomes unhealthy
+while idle; the subsequent fresh row incorrectly skips with `completed at or
+before input monitoring recovery`. This executes the real main.swift early exit.
+
+For this daemon fixture only, `TYPELESS_BOUNDARY_CAPTURE_POSTS=1` makes the
+CGEventPost interceptor log `fixture: suppressed native key posting` and return.
+It never forwards to macOS. Other boundary tests still abort posting attempts.
+Accessibility trust and focus reads remain simulated; no real app is enabled,
+no typing/dictation/Return reaches the desktop, and no installed service changes.

@@ -51,9 +51,13 @@ static bool simulated_enabled(CFMachPortRef port) {
         if (listeners[i].port == port) return listeners[i].enabled && CFMachPortIsValid(port);
     return false;
 }
-static bool simulated_permission(void) { return true; }
+static void check_fixture_consumer_request(void);
+static bool simulated_permission(void) { check_fixture_consumer_request(); return true; }
 static Boolean simulated_secure_input(void) { return false; }
 static void forbidden_post(CGEventTapLocation location, CGEventRef event) {
+    if (getenv("TYPELESS_BOUNDARY_CAPTURE_POSTS")) {
+        puts("fixture: suppressed native key posting"); fflush(stdout); return;
+    }
     fputs("unsafe event posting attempted\n", stderr); abort();
 }
 INTERPOSE(simulated_create, CGEventTapCreate)
@@ -75,12 +79,14 @@ INTERPOSE(forbidden_post, CGEventPost)
 @end
 @implementation NSWorkspace (FixtureFocus)
 + (void)load {
+    puts("fixture: isolated macOS boundary loaded"); fflush(stdout);
     method_exchangeImplementations(class_getInstanceMethod(self, @selector(frontmostApplication)),
         class_getInstanceMethod(self, @selector(fixture_frontmostApplication)));
 }
 - (NSRunningApplication *)fixture_frontmostApplication { return (id)[FixtureApplication new]; }
 @end
 static bool simulated_ax_trusted(void) { return true; }
+static bool simulated_ax_options(CFDictionaryRef options) { return true; }
 static AXError simulated_attribute(AXUIElementRef element, CFStringRef attribute, CFTypeRef *value) {
     if (CFEqual(attribute, kAXSelectedTextRangeAttribute)) {
         CFRange range = CFRangeMake(0, 0);
@@ -97,6 +103,7 @@ static AXError simulated_observer(pid_t pid, AXObserverCallback callback, AXObse
 static CFRunLoopSourceRef simulated_observer_source(AXObserverRef observer) { return (CFRunLoopSourceRef)observer; }
 static AXError simulated_observer_add(AXObserverRef observer, AXUIElementRef element, CFStringRef notification, void *context) { return kAXErrorSuccess; }
 INTERPOSE(simulated_ax_trusted, AXIsProcessTrusted)
+INTERPOSE(simulated_ax_options, AXIsProcessTrustedWithOptions)
 INTERPOSE(simulated_attribute, AXUIElementCopyAttributeValue)
 INTERPOSE(simulated_observer, AXObserverCreate)
 INTERPOSE(simulated_observer_source, AXObserverGetRunLoopSource)
@@ -166,3 +173,13 @@ INTERPOSE(simulated_tap_list, CGGetEventTapList)
 void set_enumeration_failure(int value) { fail_enumeration = value; }
 
 void set_install_during_enumeration(int value) { install_during_enumeration = value; }
+
+static void check_fixture_consumer_request(void) {
+    static bool installed;
+    const char *marker = getenv("TYPELESS_BOUNDARY_CONSUMER_MARKER");
+    if (!installed && marker && access(marker, F_OK) == 0) {
+        installed = true;
+        install_dictation_consumer();
+        puts("fixture: dictation consumer restarted"); fflush(stdout);
+    }
+}
