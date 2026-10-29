@@ -58,6 +58,8 @@ final class InputMonitor {
     private var eventOffset = 0
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
+    private var hardwareTap: CFMachPort?
+    private var hardwareTapSource: CFRunLoopSource?
     private var activationObserver: NSObjectProtocol?
     private var focusObserver: AXObserver?
     private var simulatedFocus: FocusSnapshot
@@ -80,10 +82,12 @@ final class InputMonitor {
         if dryRun { state = simulatedMonitoring }
         else {
             state = InputMonitoringState(permissionGranted: CGPreflightListenEventAccess(),
-                secureInputEnabled: IsSecureEventInputEnabled(), tapPresent: tap != nil,
-                tapValid: tap.map { CFMachPortIsValid($0) } ?? false,
-                sourcePresent: tapSource.map { CFRunLoopSourceIsValid($0) && CFRunLoopContainsSource(CFRunLoopGetMain(), $0, .commonModes) } ?? false,
-                tapEnabled: tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false)
+                secureInputEnabled: IsSecureEventInputEnabled(), tapPresent: tap != nil && hardwareTap != nil,
+                tapValid: [tap, hardwareTap].allSatisfy { $0.map { CFMachPortIsValid($0) } ?? false },
+                sourcePresent: [tapSource, hardwareTapSource].allSatisfy {
+                    $0.map { CFRunLoopSourceIsValid($0) && CFRunLoopContainsSource(CFRunLoopGetMain(), $0, .commonModes) } ?? false
+                },
+                tapEnabled: [tap, hardwareTap].allSatisfy { $0.map { CGEvent.tapIsEnabled(tap: $0) } ?? false })
         }
         // Even a health-only check before sending must remember an observed
         // gap if the OS recovers before the next recovery poll.
@@ -128,6 +132,7 @@ final class InputMonitor {
             return
         }
         guard CGPreflightListenEventAccess() else { return }
+        guard refreshHardwareTap() else { return }
         let mask = [CGEventType.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp,
                     .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp].reduce(CGEventMask(0)) {
             $0 | (CGEventMask(1) << $1.rawValue)
@@ -146,6 +151,43 @@ final class InputMonitor {
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
+    private func refreshHardwareTap() -> Bool {
+        let mask = [CGEventType.keyDown, .keyUp, .flagsChanged].reduce(CGEventMask(0)) {
+            $0 | (CGEventMask(1) << $1.rawValue)
+        }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        // Dictation apps can consume their shortcut before it reaches the session
+        // tap. Observe hardware input first, without modifying or swallowing it.
+        guard let newTap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap,
+            options: .listenOnly, eventsOfInterest: mask, callback: { _, type, event, context in
+                if let context {
+                    Unmanaged<InputMonitor>.fromOpaque(context).takeUnretainedValue().handle(type, event)
+                }
+                return Unmanaged.passUnretained(event)
+            }, userInfo: context) else { return false }
+        guard let newSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, newTap, 0) else {
+            CFMachPortInvalidate(newTap)
+            return false
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), newSource, .commonModes)
+        CGEvent.tapEnable(tap: newTap, enable: true)
+        guard CGEvent.tapIsEnabled(tap: newTap) else {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), newSource, .commonModes)
+            CFRunLoopSourceInvalidate(newSource)
+            CFMachPortInvalidate(newTap)
+            return false
+        }
+        // Attach the new tap before retiring the old one, avoiding a listening gap.
+        if let hardwareTapSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), hardwareTapSource, .commonModes)
+            CFRunLoopSourceInvalidate(hardwareTapSource)
+        }
+        if let hardwareTap { CFMachPortInvalidate(hardwareTap) }
+        hardwareTap = newTap
+        hardwareTapSource = newSource
+        return true
+    }
+
     private func removeTap() {
         if dryRun {
             simulatedMonitoring.tapPresent = false
@@ -161,6 +203,13 @@ final class InputMonitor {
         if let tap { CFMachPortInvalidate(tap) }
         tap = nil
         tapSource = nil
+        if let hardwareTapSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), hardwareTapSource, .commonModes)
+            CFRunLoopSourceInvalidate(hardwareTapSource)
+        }
+        if let hardwareTap { CFMachPortInvalidate(hardwareTap) }
+        hardwareTap = nil
+        hardwareTapSource = nil
     }
 
     private func recoverMonitoringIfNeeded() {
@@ -186,7 +235,10 @@ final class InputMonitor {
         recoveryAttempts += 1
         if state.tapPresent && state.tapValid && state.sourcePresent {
             if dryRun { simulatedMonitoring.tapEnabled = simulatedEnableSucceeds }
-            else if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            else {
+                if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+                if let hardwareTap { CGEvent.tapEnable(tap: hardwareTap, enable: true) }
+            }
         }
         if !available {
             removeTap()
@@ -283,6 +335,11 @@ final class InputMonitor {
     func beginAttempt() -> Result<FocusSnapshot, InputMonitorError> {
         recoverMonitoringIfNeeded()
         guard available else { return .failure(InputMonitorError(reason: "input monitoring unavailable: \(monitoringState.unavailableReason ?? "unknown")")) }
+        // Typeless may have installed a consuming HID tap after this daemon started.
+        // Put our passive listener ahead of it before every new countdown.
+        if !dryRun, !refreshHardwareTap() {
+            return .failure(InputMonitorError(reason: "cannot monitor dictation shortcut before interception"))
+        }
         let result = currentFocus()
         if !dryRun, case .success(let snapshot) = result, !observeFocus(pid: snapshot.processID) {
             return .failure(InputMonitorError(reason: "focus notifications unavailable"))
